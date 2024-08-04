@@ -1,7 +1,8 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import Sidebar from '$lib/components/Sidebar.svelte';
-	import { createScene } from '$lib/three/scene.js';
+	import { createScene } from '../scene.js';
+	import { Button } from 'svelte-foundry';
 
 	let canvasContainer: HTMLDivElement | null = null;
 
@@ -15,6 +16,7 @@
 <div class="app-container">
 	<Sidebar />
 	<main>
+		<Button class="">asdasd</Button>
 		<div bind:this={canvasContainer} class="canvas-container"></div>
 	</main>
 </div>
