@@ -41,7 +41,6 @@
 	"type": "module",
 	"dependencies": {
 		"@tauri-apps/api": "^1.6.0",
-		"svelte-foundry": "github:dmmarodin/svelte-foundry#develop",
 		"three": "^0.167.0"
 	}
 }

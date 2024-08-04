@@ -1,0 +1,77 @@
+$background-darker: #17191f;
+$background-dark: #1f2129;
+$background-mid: #282a36;
+$background-light: #2d303d;
+
+$border-mid: #3c4055;
+
+$text-dark: #636979;
+$text-mute: #80889c;
+$text-bright: #9da6be;
+$text-white: #dee2ed;
+
+$accent-mute: #393e4b;
+$accent-blue: #3057a8;
+$accent-purple: #644a9a;
+$accent-green: #3b9181;
+$accent-red: #a6194f;
+$accent-yellow: #c58e22;
+
+$background: (
+	'darker': $background-darker,
+	'dark': $background-dark,
+	'mid': $background-mid,
+	'light': $background-light
+);
+
+$text: (
+	'dark': $text-dark,
+	'mute': $text-mute,
+	'bright': $text-bright,
+	'white': $text-white
+);
+
+$accent: (
+	'mute': $accent-mute,
+	'blue': $accent-blue,
+	'purple': $accent-purple,
+	'green': $accent-green,
+	'red': $accent-red,
+	'yellow': $accent-yellow
+);
+
+$border: (
+	'mid': $border-mid
+);
+
+$colors_map: (
+	'bg-darker': $background-darker,
+	'bg-dark': $background-dark,
+	'bg-mid': $background-mid,
+	'bg-light': $background-light,
+	'txt-dark': $text-dark,
+	'txt-mute': $text-mute,
+	'txt-bright': $text-bright,
+	'txt-white': $text-white,
+	'acc-mute': $accent-mute,
+	'acc-blue': $accent-blue,
+	'acc-purple': $accent-purple,
+	'acc-green': $accent-green,
+	'acc-red': $accent-red,
+	'acc-yellow': $accent-yellow,
+	'border-mid': $border-mid
+);
+
+$families: (
+	'background': $background,
+	'accent': $accent,
+	'text': $text,
+	'border': $border,
+	'all': $colors_map
+);
+
+:root {
+	@each $name, $color in $colors_map {
+		--sk-#{$name}: #{$color};
+	}
+}
