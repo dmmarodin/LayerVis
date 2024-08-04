@@ -11,7 +11,8 @@ export function createCamera(container: HTMLElement, zoomFactor: number): THREE.
 		0.1,
 		1000
 	);
-	camera.position.z = 5;
+	camera.position.set(0, 0, 10);
+	camera.lookAt(0, 0, 0);
 	addCameraControls(container, camera);
 	return camera;
 }
