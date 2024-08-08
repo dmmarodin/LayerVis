@@ -1,20 +1,27 @@
 // camera.ts
 import * as THREE from 'three';
 
-export function createCamera(container: HTMLElement, zoomFactor: number): THREE.OrthographicCamera {
-	const aspect = container.clientWidth / container.clientHeight;
-	const camera = new THREE.OrthographicCamera(
-		-aspect * zoomFactor,
-		aspect * zoomFactor,
-		1 * zoomFactor,
-		-1 * zoomFactor,
-		0.1,
-		1000
-	);
-	camera.position.set(0, 0, 10);
-	camera.lookAt(0, 0, 0);
-	addCameraControls(container, camera);
-	return camera;
+export class CameraHandler extends THREE.OrthographicCamera {
+	private zoomFactor: number = 2;
+
+	public constructor(container: HTMLElement, zoomFactor: number) {
+		const aspect = container.clientWidth / container.clientHeight;
+		super(-aspect * zoomFactor, aspect * zoomFactor, 1 * zoomFactor, -1 * zoomFactor, 0.1, 1000);
+
+		this.zoomFactor = zoomFactor;
+		this.position.set(0, 0, 10);
+		this.lookAt(0, 0, 0);
+		addCameraControls(container, this);
+	}
+
+	public resize(container: HTMLElement): void {
+		const aspect = container.clientWidth / container.clientHeight;
+		this.left = -aspect * this.zoomFactor;
+		this.right = aspect * this.zoomFactor;
+		this.top = 1 * this.zoomFactor;
+		this.bottom = -1 * this.zoomFactor;
+		this.updateProjectionMatrix();
+	}
 }
 
 export function addCameraControls(container: HTMLElement, camera: THREE.OrthographicCamera): void {

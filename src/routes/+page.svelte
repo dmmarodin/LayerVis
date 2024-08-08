@@ -1,24 +1,24 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import Sidebar from '$lib/components/Sidebar.svelte';
-	import { createScene, type SceneHandler } from '../lib/three/scene';
+	import { Visualizer } from '../lib/visualizer/visualizer';
 
 	let canvasContainer: HTMLDivElement | null = null;
-	let handler: SceneHandler | null = null;
+	let visualizer: Visualizer | null = null;
 
 	onMount(() => {
 		if (canvasContainer) {
-			handler = createScene(canvasContainer);
+			visualizer = new Visualizer(canvasContainer);
 
 			if (typeof window !== 'undefined') {
-				window.addEventListener('resize', handler.resize);
+				window.addEventListener('resize', visualizer.resize);
 			}
 		}
 	});
 
 	onDestroy(() => {
-		if (handler && typeof window !== 'undefined') {
-			window.removeEventListener('resize', handler.resize);
+		if (visualizer && typeof window !== 'undefined') {
+			window.removeEventListener('resize', visualizer.resize);
 		}
 	});
 </script>
