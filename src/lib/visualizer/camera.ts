@@ -2,13 +2,20 @@
 import * as THREE from 'three';
 
 export class CameraHandler extends THREE.OrthographicCamera {
-	private zoomFactor: number = 2;
+	private currentZoom: number = 6;
 
-	public constructor(container: HTMLElement, zoomFactor: number) {
+	public constructor(container: HTMLElement, defaultZoom: number) {
 		const aspect = container.clientWidth / container.clientHeight;
-		super(-aspect * zoomFactor, aspect * zoomFactor, 1 * zoomFactor, -1 * zoomFactor, 0.1, 1000);
+		super(
+			-aspect * defaultZoom,
+			aspect * defaultZoom,
+			1 * defaultZoom,
+			-1 * defaultZoom,
+			0.1,
+			1000
+		);
 
-		this.zoomFactor = zoomFactor;
+		this.currentZoom = defaultZoom;
 		this.position.set(0, 0, 10);
 		this.lookAt(0, 0, 0);
 		addCameraControls(container, this);
@@ -16,18 +23,19 @@ export class CameraHandler extends THREE.OrthographicCamera {
 
 	public resize(container: HTMLElement): void {
 		const aspect = container.clientWidth / container.clientHeight;
-		this.left = -aspect * this.zoomFactor;
-		this.right = aspect * this.zoomFactor;
-		this.top = 1 * this.zoomFactor;
-		this.bottom = -1 * this.zoomFactor;
+		this.left = -aspect * this.currentZoom;
+		this.right = aspect * this.currentZoom;
+		this.top = 1 * this.currentZoom;
+		this.bottom = -1 * this.currentZoom;
 		this.updateProjectionMatrix();
 	}
 }
 
 export function addCameraControls(container: HTMLElement, camera: THREE.OrthographicCamera): void {
 	function onWheel(event: WheelEvent) {
-		const delta = Math.sign(event.deltaY) * 0.1;
-		camera.zoom = Math.max(0.1, camera.zoom - delta);
+		const zoomSpeed = 1.1;
+		const delta = event.deltaY < 0 ? zoomSpeed : 1 / zoomSpeed;
+		camera.zoom = Math.max(0.02, camera.zoom * delta);
 		camera.updateProjectionMatrix();
 	}
 

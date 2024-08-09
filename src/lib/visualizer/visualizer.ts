@@ -1,7 +1,7 @@
 import { Context } from './context';
 import { SceneManager } from './scene';
 
-// Public facing API por visualizer
+// Public facing API for visualizer
 export class Visualizer {
 	private scene: SceneManager;
 

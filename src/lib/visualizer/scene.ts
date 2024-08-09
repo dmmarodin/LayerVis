@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { Context } from './context';
 import { CameraHandler } from './camera';
-import { InfiniteGrid } from './grid';
+import { Grid } from './grid';
 
 export class SceneManager {
 	public constructor() {}
@@ -10,10 +10,10 @@ export class SceneManager {
 		const context: Context = Context.getInstance();
 		context.setScene(new THREE.Scene());
 		context.setRenderer(this.createRenderer(parentComponent));
-		context.setCamera(new CameraHandler(parentComponent, 2));
+		context.setCamera(new CameraHandler(parentComponent, 15));
 		context.setParentComponent(parentComponent);
 
-		const grid = InfiniteGrid.create(100, 100);
+		const grid = Grid.create(1000, 1000);
 		context.scene.background = new THREE.Color(0x1f2129);
 		context.scene.add(grid);
 		this.update();
