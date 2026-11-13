@@ -15,7 +15,7 @@ let doc = GraphDoc::from_json(&std::fs::read_to_string("graph.json")?)?;
 let config = PipelineConfig::new(
     WorldBounds::new((-4096, -4096, 0), (8192, 8192, 128))?,
     ChunkSize::new(32, 32, 32)?,
-    seed,
+    doc.seed, // the seed saved with the graph (or your own, e.g. per save game)
 );
 
 // World models (tectonics…) are built once per seed and shared.
@@ -51,6 +51,7 @@ reading the same name.
 ```json
 {
   "format": 1,
+  "seed": 12345,
   "nodes": [
     { "id": "n1", "kind": "elevation", "position": [0, 0] },
     { "id": "n2", "kind": "smooth", "params": { "radius": 2 }, "position": [300, 0] },
@@ -64,6 +65,8 @@ reading the same name.
 }
 ```
 
+- `seed` (u64, default 12345 when missing): the world seed. A JSON number; JS
+  readers lose precision above 2^53, so read it with a u64-safe parser.
 - `id`: unique, stable. `enabled` (default true), `position` (layout only),
   `params` (missing → defaults, values clamped), `label`, `script` are optional.
 - An input takes one edge; outputs fan out. Socket types must match
