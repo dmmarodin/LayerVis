@@ -19,13 +19,16 @@
 //! // later: chunk.chunk_data().columns[(x, y, 0)][height.slot]
 //! ```
 
+pub mod climate;
 pub mod graph;
 pub mod lru;
+pub mod migrate;
 pub mod pipeline;
 #[cfg(feature = "scripting")]
 pub mod script;
 pub mod steps;
 pub mod tectonics;
+pub mod terrain;
 pub mod world;
 
 use std::sync::{Arc, Mutex};
@@ -39,16 +42,19 @@ use serde::Serialize;
 pub use graph::{EdgeDoc, FrameDoc, GraphDoc, NodeDoc, SocketRef, DEFAULT_SEED};
 pub use lru::{ByteLru, Weigh};
 pub use pipeline::{
-    analyze, creates_cycle, resolve, Analysis, EdgeReport, Export, NodeReport, NodeStatus,
-    Schema, StepTiming, Text,
+    analyze, build_world_graph, creates_cycle, resolve, world_signature, Analysis, EdgeReport,
+    Export, NodeReport, NodeStatus, ParamReport, Schema, StepTiming, Text, WorldBuildContext,
+    WorldGraph, WorldSampleBinding, WorldStep,
 };
-pub use world::{WorldSample, WorldStore};
+pub use world::{WorldStats, WorldStore};
 
 use pipeline::{build_neighborhood, DynPipeline, ResolvedNode, Timings};
 
 /// One slot per node output (SSA), so column slots are generous.
 pub const VOXEL_SLOTS: usize = 4;
 pub const COLUMN_SLOTS: usize = 16;
+/// World-scope outputs (one slot per world node output).
+pub const WORLD_SLOTS: usize = 16;
 
 /// Field-bag voxel: outputs map to fixed slots via the schema.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -85,6 +91,26 @@ pub enum FieldScope {
     Voxel,
     Column,
     World,
+}
+
+impl FieldScope {
+    /// Wires run downward through the scopes: world values feed chunk nodes
+    /// (sampled once per column), never the other way around.
+    pub fn rank(self) -> u8 {
+        match self {
+            FieldScope::World => 0,
+            FieldScope::Column => 1,
+            FieldScope::Voxel => 2,
+        }
+    }
+}
+
+/// Can an output of scope `from` be wired into an input of scope `to`?
+/// Equal types connect; a world output may also feed a column input (it is
+/// sampled at every column). Nothing flows from chunk or voxel scope into
+/// world nodes, and voxel inputs only take voxel values.
+pub fn can_connect(from: FieldScope, to: FieldScope) -> bool {
+    from == to || (from == FieldScope::World && to == FieldScope::Column)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -178,6 +204,12 @@ impl GraphPipeline {
         config: PipelineConfig,
         world: &Arc<WorldStore>,
     ) -> Result<Self, String> {
+        if world.signature() != world_signature(doc) {
+            return Err("The world was not built from this graph's world nodes \
+                        (build it with WorldStore::for_doc)"
+                .to_owned());
+        }
+
         let resolved: Vec<ResolvedNode> = doc.nodes.iter().map(resolve).collect();
         let analysis = analyze(doc, &resolved);
         let timings = Arc::new(Timings::for_analysis(doc, &analysis));
@@ -270,6 +302,19 @@ impl GraphPipeline {
         &self.analysis
     }
 
+    /// World slot of the terrain's elevation: the last world output named
+    /// `elevation` (so an elevation filter wins over the elevation it filters).
+    /// What land/ocean statistics read.
+    pub fn elevation_world_slot(&self) -> Option<usize> {
+        self.analysis
+            .schema
+            .world_fields()
+            .iter()
+            .rev()
+            .find(|field| field.name == "elevation")
+            .map(|field| field.slot)
+    }
+
     /// Per-node mean time per generated chunk.
     pub fn timings(&self) -> Vec<StepTiming> {
         self.timings.snapshot()
@@ -306,29 +351,4 @@ impl GenerationDefinition<Voxel> for GraphDefinition {
     ) -> Result<Chunk<Voxel, ColumnData>, String> {
         self.inner.generate_chunk_with_shared(coord, shared)
     }
-}
-
-/// World-model fields, in `WorldSample::values()` order.
-pub fn world_fields() -> Vec<FieldDef> {
-    let field = |slot: usize, name: &'static str, unit: &'static str, min, max, ramp: &'static str| {
-        FieldDef {
-            key: name.to_owned(),
-            node: String::new(),
-            node_label: String::new(),
-            name: name.into(),
-            scope: FieldScope::World,
-            slot,
-            unit: unit.into(),
-            min,
-            max,
-            ramp: ramp.into(),
-        }
-    };
-
-    vec![
-        field(0, "plate", "id", 0.0, world::PLATE_COUNT as f32, "categorical"),
-        field(1, "boundary_distance", "cells", 0.0, 400.0, "grayscale"),
-        field(2, "convergence", "", -1.5, 1.5, "diverging"),
-        field(3, "elevation", "cells", 0.0, 128.0, "terrain"),
-    ]
 }

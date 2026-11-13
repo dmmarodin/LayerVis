@@ -1,8 +1,5 @@
 import type { Frame, NodeReport } from '$lib/bridge';
 
-/** Hidden target handle on every step node that world-model edges attach to. */
-export const WORLD_HANDLE = '__world';
-
 export interface StepNodeData extends Record<string, unknown> {
 	node: NodeReport;
 	selected: boolean;
@@ -25,8 +22,4 @@ export interface FrameNodeData extends Record<string, unknown> {
 export interface RerouteNodeData extends Record<string, unknown> {
 	node: NodeReport;
 	selected: boolean;
-}
-
-export interface WorldNodeData extends Record<string, unknown> {
-	model: string;
 }

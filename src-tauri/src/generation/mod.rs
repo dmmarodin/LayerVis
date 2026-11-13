@@ -15,15 +15,15 @@ use cache::{CacheKey, PayloadCache};
 use layergen::{ChunkCoord, ChunkSize, PipelineConfig, WorldBounds};
 use serde::Serialize;
 use worldgraph::{
-    creates_cycle, graph::id_order, pipeline::SCRIPT_KIND, resolve, steps, ColumnData, EdgeDoc,
-    Export, FieldDef, FieldScope, FrameDoc, GraphDoc, GraphPipeline, NodeDoc, NodeReport, NodeStatus,
-    SocketRef, Voxel,
+    can_connect, creates_cycle, graph::id_order, pipeline::SCRIPT_KIND, resolve, steps,
+    world_signature, ColumnData, EdgeDoc, Export, FieldDef, FieldScope, FrameDoc, GraphDoc,
+    GraphPipeline, NodeDoc, NodeReport, NodeStatus, SocketRef, Voxel, WorldStats,
 };
 
 #[cfg(test)]
 use layergen::Chunk;
 
-pub use worldgraph::{EdgeReport, StepTiming, WorldSample, WorldStore};
+pub use worldgraph::{EdgeReport, StepTiming, WorldStore};
 
 use rayon::prelude::*;
 
@@ -51,11 +51,17 @@ pub struct WorldInfo {
     /// Column outputs in the order they appear in chunk payloads.
     pub column_fields: Vec<FieldDef>,
     pub voxel_fields: Vec<FieldDef>,
-    /// World-model fields, in the order they appear in world payloads.
+    /// Outputs of world-scope nodes, in the order they appear in world
+    /// payloads (overview samples).
     pub world_fields: Vec<FieldDef>,
     /// Game-facing named outputs (Export nodes).
     pub exports: Vec<Export>,
-    pub plate_count: usize,
+    /// Coarse facts about the current world (land fraction, landmasses, …),
+    /// read from the terrain's `elevation` world output.
+    pub world_stats: WorldStats,
+    /// Changes when the world stage is rebuilt (seed or world nodes): cached
+    /// overview samples are stale then.
+    pub world_generation: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -64,14 +70,37 @@ pub struct KindInfo {
     pub id: &'static str,
     pub label: &'static str,
     pub description: &'static str,
+    /// Where the node runs: world, chunk (`column`) or voxel.
+    pub scope: FieldScope,
 }
 
-/// World model → node (display only: world models are always available).
+/// A starting graph (File → New from template).
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WorldEdge {
-    pub model: String,
-    pub to: String,
+pub struct TemplateInfo {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub description: &'static str,
+}
+
+pub fn templates() -> Vec<TemplateInfo> {
+    steps::TEMPLATES
+        .iter()
+        .map(|template| TemplateInfo {
+            id: template.id,
+            label: template.label,
+            description: template.description,
+        })
+        .collect()
+}
+
+/// The doc of a template, or an error for an unknown id.
+pub fn template_doc(id: &str) -> Result<GraphDoc, String> {
+    steps::TEMPLATES
+        .iter()
+        .find(|template| template.id == id)
+        .map(|template| (template.build)())
+        .ok_or_else(|| format!("Unknown template `{id}`"))
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -80,13 +109,11 @@ pub struct PipelineGraph {
     pub revision: u64,
     pub nodes: Vec<NodeReport>,
     pub edges: Vec<EdgeReport>,
-    pub world_edges: Vec<WorldEdge>,
     pub exports: Vec<Export>,
     /// Editor annotations (layout only).
     pub frames: Vec<FrameDoc>,
     /// Built-in kinds that can be added.
     pub kinds: Vec<KindInfo>,
-    pub world_models: Vec<&'static str>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -105,15 +132,34 @@ struct Active {
     /// publishes a revision with a new world stage.
     config: PipelineConfig,
     world: Arc<WorldStore>,
+    /// Coarse facts about `world` (land fraction, landmasses), computed once
+    /// per world stage.
+    stats: WorldStats,
+    /// Counts world stages built in this session: the overview map is
+    /// resampled when it changes (a new seed, params or world nodes), not when
+    /// only chunk or voxel nodes change.
+    world_generation: u64,
     pipeline: GraphPipeline,
 }
 
-/// A doc built into a pipeline, with the world stage for its seed.
+/// A doc built into a pipeline, with the world stage for its seed, params and
+/// world nodes.
 struct Built {
     config: PipelineConfig,
     world: Arc<WorldStore>,
+    stats: WorldStats,
+    world_generation: u64,
     pipeline: GraphPipeline,
 }
+
+const NO_WORLD_STATS: WorldStats = WorldStats {
+    land_fraction: 0.0,
+    landmasses: 0,
+    edge_land: 0.0,
+};
+
+/// Samples per side of the coarse grid behind `WorldStats`.
+const STATS_RESOLUTION: usize = 96;
 
 fn config_for(seed: u64) -> Result<PipelineConfig, String> {
     Ok(PipelineConfig::new(
@@ -123,21 +169,42 @@ fn config_for(seed: u64) -> Result<PipelineConfig, String> {
     ))
 }
 
-/// Builds `doc`, reusing the world stage of `previous` when the seed is the
-/// same (the world stage is built once per seed and serves every revision).
+/// Builds `doc`, reusing the world stage of `previous` when the seed and the
+/// world-scope nodes are the same: the world is built once and serves every
+/// revision until one of those changes. Editing chunk or voxel nodes never
+/// rebuilds it.
 fn build(doc: &GraphDoc, previous: Option<&Active>) -> Result<Built, String> {
-    let (config, world) = match previous.filter(|active| active.config.seed() == doc.seed) {
-        Some(active) => (active.config, Arc::clone(&active.world)),
+    let signature = world_signature(doc);
+    let reusable = previous
+        .filter(|active| active.config.seed() == doc.seed && active.world.signature() == signature);
+
+    let (config, world, reused) = match reusable {
+        Some(active) => (active.config, Arc::clone(&active.world), Some(active)),
         None => {
             let config = config_for(doc.seed)?;
-            (config, Arc::new(WorldStore::new(&config)))
+            let world = Arc::new(WorldStore::for_doc(doc, &config)?);
+            (config, world, None)
         }
     };
     let pipeline = GraphPipeline::build(doc, config, &world)?;
 
+    // Land statistics read the terrain's elevation output; a world without
+    // one (no terrain nodes) has nothing to report.
+    let (stats, world_generation) = match reused {
+        Some(active) => (active.stats, active.world_generation),
+        None => (
+            pipeline
+                .elevation_world_slot()
+                .map_or(NO_WORLD_STATS, |slot| world.stats(slot, STATS_RESOLUTION)),
+            previous.map_or(1, |active| active.world_generation + 1),
+        ),
+    };
+
     Ok(Built {
         config,
         world,
+        stats,
+        world_generation,
         pipeline,
     })
 }
@@ -174,6 +241,8 @@ impl State {
             revision: self.active.revision + 1,
             config: built.config,
             world: built.world,
+            stats: built.stats,
+            world_generation: built.world_generation,
             pipeline: built.pipeline,
         });
     }
@@ -206,6 +275,8 @@ impl Session {
                     revision: 0,
                     config: built.config,
                     world: built.world,
+                    stats: built.stats,
+                    world_generation: built.world_generation,
                     pipeline: built.pipeline,
                 }),
                 undo: Vec::new(),
@@ -284,9 +355,12 @@ impl Session {
             revision: active.revision,
             column_fields: active.pipeline.schema().column_fields(),
             voxel_fields: active.pipeline.schema().voxel_fields(),
-            world_fields: worldgraph::world_fields(),
+            // The outputs of world-scope nodes, in the order world payloads
+            // carry their planes.
+            world_fields: active.pipeline.schema().world_fields(),
             exports: active.pipeline.exports().to_vec(),
-            plate_count: active.world.tectonics.plates().len(),
+            world_stats: active.stats,
+            world_generation: active.world_generation,
         }
     }
 
@@ -313,21 +387,10 @@ impl Session {
             })
             .collect::<Vec<_>>();
 
-        let world_edges = nodes
-            .iter()
-            .flat_map(|node| {
-                node.world_reads.iter().map(|model| WorldEdge {
-                    model: model.clone(),
-                    to: node.id.clone(),
-                })
-            })
-            .collect();
-
         PipelineGraph {
             revision: state.active.revision,
             nodes,
             edges: analysis.edges.clone(),
-            world_edges,
             exports: analysis.exports.clone(),
             frames: state.doc.frames.clone(),
             kinds: steps::registry()
@@ -336,9 +399,14 @@ impl Session {
                     id: kind.id,
                     label: kind.label,
                     description: kind.description,
+                    scope: kind
+                        .outputs
+                        .first()
+                        .map(|output| output.scope)
+                        .or_else(|| kind.inputs.first().map(|input| input.scope))
+                        .unwrap_or(FieldScope::Column),
                 })
                 .collect(),
-            world_models: vec!["tectonics"],
         }
     }
 
@@ -469,7 +537,7 @@ impl Session {
             let kind = match scope {
                 FieldScope::Column => "reroute_column",
                 FieldScope::Voxel => "reroute_voxel",
-                FieldScope::World => return Err("World fields have no wires".to_owned()),
+                FieldScope::World => "reroute_world",
             };
 
             id = doc.next_id();
@@ -624,7 +692,7 @@ impl Session {
             let out_scope = socket_scope(&from.node, &from.socket, true)?;
             let in_scope = socket_scope(&to.node, &to.socket, false)?;
 
-            if out_scope != in_scope {
+            if !can_connect(out_scope, in_scope) {
                 return Err(format!(
                     "Cannot connect a {out_scope:?} output to a {in_scope:?} input"
                 ));
@@ -822,10 +890,19 @@ impl Session {
 
         let (w, h) = (width as usize, height as usize);
         let step_cells = i64::from(step);
-        let world = self.active().world.clone();
-        let world = &*world;
+        let active = self.active();
+        let world = &*active.world;
 
-        let rows: Vec<Vec<[f32; WorldSample::FIELD_COUNT]>> = (0..h)
+        // One plane per world-node output.
+        let slots: Vec<usize> = active
+            .pipeline
+            .schema()
+            .world_fields()
+            .iter()
+            .map(|field| field.slot)
+            .collect();
+
+        let rows: Vec<Vec<Vec<f32>>> = (0..h)
             .into_par_iter()
             .map(|j| {
                 let y = origin.1 + j as i64 * step_cells;
@@ -834,30 +911,42 @@ impl Session {
                     .map(|i| {
                         let x = origin.0 + i as i64 * step_cells;
 
-                        if world.contains_column(x, y) {
-                            world.sample(x, y).values()
-                        } else {
-                            [f32::NAN; WorldSample::FIELD_COUNT]
+                        if !world.contains_column(x, y) {
+                            return vec![f32::NAN; slots.len()];
                         }
+
+                        let values = world.graph().eval(x, y);
+                        slots.iter().map(|&slot| values[slot] as f32).collect()
                     })
                     .collect()
             })
             .collect();
 
-        let planes: Vec<Vec<f32>> = (0..WorldSample::FIELD_COUNT)
+        let planes: Vec<Vec<f32>> = (0..slots.len())
             .map(|field| rows.iter().flatten().map(|values| values[field]).collect())
             .collect();
 
         Ok(encode_planes(origin, step, width, height, 0, &planes))
     }
 
-    /// All world fields at one column, or None outside the world.
-    pub fn world_point(&self, x: i64, y: i64) -> Option<WorldSample> {
+    /// All world fields at one column, in `WorldInfo::world_fields` order, or
+    /// None outside the world.
+    pub fn world_point(&self, x: i64, y: i64) -> Option<Vec<f64>> {
         let active = self.active();
-        active
-            .world
-            .contains_column(x, y)
-            .then(|| active.world.sample(x, y))
+        if !active.world.contains_column(x, y) {
+            return None;
+        }
+
+        let values = active.world.graph().eval(x, y);
+        Some(
+            active
+                .pipeline
+                .schema()
+                .world_fields()
+                .iter()
+                .map(|field| values[field.slot])
+                .collect(),
+        )
     }
 
     #[cfg(test)]
@@ -896,7 +985,7 @@ fn latest_output(active: &Active, name: &str, scope: FieldScope) -> Option<Socke
         .filter(|node| {
             node.outputs
                 .iter()
-                .any(|o| o.name == name && o.scope == scope)
+                .any(|o| o.name == name && can_connect(o.scope, scope))
         })
         .map(|node| (node.order.filter(|_| node.status == NodeStatus::Active), node))
         .collect();
@@ -986,6 +1075,12 @@ fn encode_columns(
 mod tests {
     use super::*;
 
+    // Default graph: n1 tectonics, n2 tectonic_elevation, n3 temperature (all
+    // world nodes), n4 solid, n5 export `height`. Chunk and voxel nodes read
+    // world values through implicit sampled column slots, so the default
+    // graph has no chunk column fields: add a chunk node (slope, smooth, …)
+    // to get one.
+
     fn socket(node: &str, socket: &str) -> SocketRef {
         SocketRef {
             node: node.into(),
@@ -997,22 +1092,46 @@ mod tests {
         graph.nodes.iter().find(|n| n.id == id).unwrap()
     }
 
+    /// World elevation at a column, as the chunk nodes see it (f32).
+    fn world_elevation(session: &Session, x: i64, y: i64) -> f32 {
+        let active = session.active();
+        let slot = active.pipeline.elevation_world_slot().unwrap();
+        active.world.graph().eval(x, y)[slot] as f32
+    }
+
+    /// Column slot holding the sampled copy of the world elevation.
+    fn sampled_elevation(session: &Session) -> usize {
+        let active = session.active();
+        let world_slot = active.pipeline.elevation_world_slot().unwrap();
+        active
+            .pipeline
+            .analysis()
+            .world_samples
+            .iter()
+            .find(|binding| binding.world_slot == world_slot)
+            .expect("a chunk node reads the elevation")
+            .column_slot
+    }
+
     #[test]
     fn generates_deterministic_column_payload() {
         let session = Session::new(42).unwrap();
+        session.add_node("slope", (0.0, 0.0), None).unwrap(); // a chunk node: n6
         let fields = session.active().pipeline.schema().column_fields();
         let coord = ChunkCoord(128, 128, 0);
         let first = encode_columns(&session.generate(coord).unwrap(), &fields, 0);
         let again = encode_columns(&session.generate(coord).unwrap(), &fields, 0);
 
         assert_eq!(first, again);
-        assert_eq!(first.len(), PAYLOAD_HEADER_BYTES + 2 * 32 * 32 * 4);
+        assert_eq!(first.len(), PAYLOAD_HEADER_BYTES + 32 * 32 * 4);
         assert_eq!(&first[0..4], &PAYLOAD_VERSION.to_le_bytes());
         assert_eq!(i64::from_le_bytes(first[16..24].try_into().unwrap()), 0);
         assert_eq!(u32::from_le_bytes(first[32..36].try_into().unwrap()), 1);
 
+        // Elevation and climate are world values: the chunk column fields are
+        // what chunk nodes compute.
         let keys: Vec<_> = fields.iter().map(|f| f.key.as_str()).collect();
-        assert_eq!(keys, ["n1.elevation", "n2.temperature"]);
+        assert_eq!(keys, ["n6.slope"]);
     }
 
     #[test]
@@ -1024,14 +1143,29 @@ mod tests {
             .world_payload((origin.0, origin.1), 1, 32, 32)
             .unwrap();
 
-        // Elevation is world field 3.
-        let plane = PAYLOAD_HEADER_BYTES + 3 * 32 * 32 * 4;
+        let info = session.world_info();
+        let keys: Vec<_> = info.world_fields.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "n1.plate",
+                "n1.boundary_distance",
+                "n1.convergence",
+                "n1.continental",
+                "n1.neighbor_continental",
+                "n2.elevation",
+                "n3.temperature"
+            ]
+        );
+        let elevation_plane = keys.iter().position(|k| *k == "n2.elevation").unwrap();
+        let plane = PAYLOAD_HEADER_BYTES + elevation_plane * 32 * 32 * 4;
+        let sampled = sampled_elevation(&session);
 
         for (column, x, y, _) in chunk.chunk_data().columns.iter() {
             let offset = plane + (x + y * 32) * 4;
             let world = f32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap());
 
-            assert_eq!(world, column[session.slot("n1.elevation")]);
+            assert_eq!(world, column[sampled]);
         }
     }
 
@@ -1046,7 +1180,11 @@ mod tests {
         assert!(!inside.is_nan());
         assert!(session.world_payload((0, 0), 1, 2048, 2048).is_err());
         assert!(session.world_point(-5000, 0).is_none());
-        assert!(session.world_point(0, 0).is_some());
+
+        // The hover values follow the world field order.
+        let values = session.world_point(0, 0).unwrap();
+        assert_eq!(values.len(), session.world_info().world_fields.len());
+        assert_eq!(values[5] as f32, world_elevation(&session, 0, 0));
     }
 
     #[test]
@@ -1067,12 +1205,13 @@ mod tests {
     fn solid_cells_follow_column_elevation() {
         let session = Session::new(7).unwrap();
         let chunk = session.generate(ChunkCoord(128, 128, 0)).unwrap();
+        let sampled = sampled_elevation(&session);
 
         for (voxel, x, y, z) in chunk.data().iter() {
-            let elevation = chunk.chunk_data().columns[(x, y, 0)][session.slot("n1.elevation")];
+            let elevation = chunk.chunk_data().columns[(x, y, 0)][sampled];
             let expected = if (z as f32) < elevation { 1.0 } else { 0.0 };
 
-            assert_eq!(voxel.slots[session.slot("n3.solid")], expected);
+            assert_eq!(voxel.slots[session.slot("n4.solid")], expected);
         }
     }
 
@@ -1081,30 +1220,27 @@ mod tests {
         let session = Session::new(3).unwrap();
         let left = session.generate(ChunkCoord(10, 10, 0)).unwrap();
         let right = session.generate(ChunkCoord(11, 10, 0)).unwrap();
-        let world_store = session.world();
-        let world = &*world_store;
+        let sampled = sampled_elevation(&session);
 
-        let elevation = session.slot("n1.elevation");
-        let left_edge = left.chunk_data().columns[(31, 5, 0)][elevation];
-        let right_edge = right.chunk_data().columns[(0, 5, 0)][elevation];
+        let left_edge = left.chunk_data().columns[(31, 5, 0)][sampled];
+        let right_edge = right.chunk_data().columns[(0, 5, 0)][sampled];
         let (lx, ly) = (left.origin().0 + 31, left.origin().1 + 5);
 
-        assert_eq!(left_edge, world.elevation_at(lx, ly));
-        assert_eq!(right_edge, world.elevation_at(lx + 1, ly));
+        assert_eq!(left_edge, world_elevation(&session, lx, ly));
+        assert_eq!(right_edge, world_elevation(&session, lx + 1, ly));
     }
 
     #[test]
     fn adding_nodes_auto_connects_by_name_and_publishes_revisions() {
         let session = Session::new(1).unwrap();
-        let (id, graph) = session.add_node("humidity", (600.0, 0.0), None).unwrap();
+        let (id, graph) = session.add_node("slope", (600.0, 0.0), None).unwrap();
 
-        assert_eq!(id, "n5");
+        assert_eq!(id, "n6");
         assert_eq!(graph.revision, 1);
-        assert_eq!(node(&graph, "n5").status, NodeStatus::Active);
-        assert!(graph.edges.iter().any(|e| e.from == socket("n1", "elevation")
-            && e.to == socket("n5", "elevation")));
-        assert!(graph.edges.iter().any(|e| e.from == socket("n2", "temperature")
-            && e.to == socket("n5", "temperature")));
+        assert_eq!(node(&graph, "n6").status, NodeStatus::Active);
+        // A column input picks up the world output of the same name.
+        assert!(graph.edges.iter().any(|e| e.from == socket("n2", "elevation")
+            && e.to == socket("n6", "elevation")));
 
         let keys: Vec<_> = session
             .world_info()
@@ -1112,74 +1248,82 @@ mod tests {
             .iter()
             .map(|f| f.key.clone())
             .collect();
-        assert_eq!(keys, ["n1.elevation", "n2.temperature", "n5.humidity"]);
+        assert_eq!(keys, ["n6.slope"]);
 
-        // Disabling the source blocks everything downstream.
-        let graph = session.set_enabled("n1", false).unwrap();
-        assert!(["n2", "n3", "n4", "n5"]
+        // World nodes auto-connect to world outputs of the same name.
+        let (humidity, graph) = session.add_node("humidity", (600.0, 0.0), None).unwrap();
+        assert!(graph.edges.iter().any(|e| e.from == socket("n3", "temperature")
+            && e.to == socket(&humidity, "temperature")));
+        assert_eq!(node(&graph, &humidity).scope, FieldScope::World);
+        session.undo().unwrap();
+
+        // Disabling the elevation blocks everything that reads it.
+        let graph = session.set_enabled("n2", false).unwrap();
+        assert!(["n3", "n4", "n5", "n6"]
             .iter()
             .all(|id| node(&graph, id).status == NodeStatus::Blocked));
         assert!(session.world_info().column_fields.is_empty());
 
         // Removing a node removes its edges.
-        let graph = session.remove_node("n2").unwrap();
-        assert!(graph.edges.iter().all(|e| e.from.node != "n2" && e.to.node != "n2"));
-        assert_eq!(graph.revision, 3);
+        let graph = session.remove_node("n3").unwrap();
+        assert!(graph.edges.iter().all(|e| e.from.node != "n3" && e.to.node != "n3"));
+        assert_eq!(graph.revision, 5);
     }
 
     #[test]
     fn connect_rejects_mismatched_types_unknown_sockets_and_cycles() {
         let session = Session::new(1).unwrap();
-        session.add_node("smooth", (0.0, 0.0), None).unwrap(); // n5, auto: none named "value"
-        session.add_node("smooth", (0.0, 0.0), None).unwrap(); // n6
+        session.add_node("smooth", (0.0, 0.0), None).unwrap(); // n6, auto: none named "value"
+        session.add_node("smooth", (0.0, 0.0), None).unwrap(); // n7
 
-        let voxel_to_column = session.connect(socket("n3", "solid"), socket("n5", "value"));
+        let voxel_to_column = session.connect(socket("n4", "solid"), socket("n6", "value"));
         assert!(voxel_to_column.unwrap_err().contains("Cannot connect"));
 
+        // Nothing flows from chunk scope into a world node.
+        let chunk_to_world = session.connect(socket("n6", "smoothed"), socket("n2", "convergence"));
+        assert!(chunk_to_world.unwrap_err().contains("Cannot connect"));
+
         assert!(session
-            .connect(socket("n1", "nope"), socket("n5", "value"))
+            .connect(socket("n2", "nope"), socket("n6", "value"))
             .unwrap_err()
             .contains("no output"));
 
+        // A world output feeds a chunk input.
         session
-            .connect(socket("n1", "elevation"), socket("n5", "value"))
+            .connect(socket("n2", "elevation"), socket("n6", "value"))
             .unwrap();
         session
-            .connect(socket("n5", "smoothed"), socket("n6", "value"))
+            .connect(socket("n6", "smoothed"), socket("n7", "value"))
             .unwrap();
         assert!(session
-            .connect(socket("n6", "smoothed"), socket("n5", "value"))
+            .connect(socket("n7", "smoothed"), socket("n6", "value"))
             .unwrap_err()
             .contains("cycle"));
 
         // Reconnecting an input replaces its edge.
         let graph = session
-            .connect(socket("n5", "smoothed"), socket("n2", "elevation"))
+            .connect(socket("n6", "smoothed"), socket("n5", "value"))
             .unwrap();
-        let into_n2: Vec<_> = graph.edges.iter().filter(|e| e.to.node == "n2").collect();
-        assert_eq!(into_n2.len(), 1);
-        assert_eq!(into_n2[0].from, socket("n5", "smoothed"));
+        let into_n5: Vec<_> = graph.edges.iter().filter(|e| e.to.node == "n5").collect();
+        assert_eq!(into_n5.len(), 1);
+        assert_eq!(into_n5[0].from, socket("n6", "smoothed"));
 
-        assert!(session.disconnect(socket("n2", "elevation")).is_ok());
-        assert!(session.disconnect(socket("n2", "elevation")).is_err());
+        assert!(session.disconnect(socket("n5", "value")).is_ok());
+        assert!(session.disconnect(socket("n5", "value")).is_err());
     }
 
     #[test]
     fn smooth_reprocesses_a_value_that_downstream_nodes_read() {
         let session = Session::new(8).unwrap();
-        session.add_node("smooth", (0.0, 0.0), None).unwrap(); // n5
+        session.add_node("smooth", (0.0, 0.0), None).unwrap(); // n6
         session
-            .connect(socket("n1", "elevation"), socket("n5", "value"))
+            .connect(socket("n2", "elevation"), socket("n6", "value"))
             .unwrap();
-        session.set_param("n5", "radius", 1.0).unwrap();
-        // Temperature now reads smoothed elevation; raw elevation still exists.
-        session
-            .connect(socket("n5", "smoothed"), socket("n2", "elevation"))
-            .unwrap();
+        session.set_param("n6", "radius", 1.0).unwrap();
 
         let chunk = session.generate(ChunkCoord(140, 90, 0)).unwrap();
-        let (origin, smoothed) = (chunk.origin(), session.slot("n5.smoothed"));
-        let e = |x: i64, y: i64| f64::from(session.world().elevation_at(x, y));
+        let (origin, smoothed) = (chunk.origin(), session.slot("n6.smoothed"));
+        let e = |x: i64, y: i64| f64::from(world_elevation(&session, x, y));
 
         for (x, y) in [(0usize, 0usize), (31, 31), (15, 0)] {
             let (gx, gy) = (origin.0 + x as i64, origin.1 + y as i64);
@@ -1193,12 +1337,12 @@ mod tests {
             let column = chunk.chunk_data().columns[(x, y, 0)];
 
             assert_eq!(column[smoothed], expected);
-            assert_ne!(column[smoothed], column[session.slot("n1.elevation")]);
+            assert_ne!(column[smoothed], column[sampled_elevation(&session)]);
         }
 
         let graph = session.pipeline_graph();
-        assert_eq!(node(&graph, "n5").neighborhood, Some((1, 1, 0)));
-        assert!(session.set_param("n5", "bogus", 1.0).is_err());
+        assert_eq!(node(&graph, "n6").neighborhood, Some((1, 1, 0)));
+        assert!(session.set_param("n6", "bogus", 1.0).is_err());
     }
 
     #[test]
@@ -1209,7 +1353,7 @@ mod tests {
 
         let chunk = session.generate(ChunkCoord(140, 90, 0)).unwrap();
         let (origin, out) = (chunk.origin(), session.slot(&format!("{id}.slope")));
-        let e = |x: i64, y: i64| session.world().elevation_at(x, y);
+        let e = |x: i64, y: i64| world_elevation(&session, x, y);
 
         for (x, y) in [(0usize, 0usize), (31, 31), (0, 17), (31, 3), (12, 0), (5, 31)] {
             let (gx, gy) = (origin.0 + x as i64, origin.1 + y as i64);
@@ -1225,22 +1369,23 @@ mod tests {
         let session = Session::new(6).unwrap();
         session.add_node("slope", (0.0, 0.0), None).unwrap();
 
-        let elevation_runs = || {
+        // The world sampling runs with the prefix: once per dependency chunk.
+        let sampling_runs = || {
             session
                 .step_timings()
                 .1
                 .iter()
-                .find(|t| t.id == "n1")
+                .find(|t| t.id == "world")
                 .unwrap()
                 .runs
         };
 
-        let before = elevation_runs();
+        let before = sampling_runs();
         session.column_payload(ChunkCoord(60, 60, 0)).unwrap();
-        assert_eq!(elevation_runs() - before, 9);
+        assert_eq!(sampling_runs() - before, 9);
 
         session.column_payload(ChunkCoord(61, 60, 0)).unwrap();
-        assert_eq!(elevation_runs() - before, 12);
+        assert_eq!(sampling_runs() - before, 12);
     }
 
     #[test]
@@ -1253,8 +1398,11 @@ mod tests {
         let script = node(&graph, &id);
         assert!(script.script);
         assert_eq!(script.status, NodeStatus::Active);
-        assert!(graph.edges.iter().any(|e| e.from == socket("n2", "temperature")
+        assert!(graph.edges.iter().any(|e| e.from == socket("n3", "temperature")
             && e.to == socket(&id, "temperature")));
+        // World values wire into script inputs by name, too.
+        assert!(graph.edges.iter().any(|e| e.from == socket("n1", "boundary_distance")
+            && e.to == socket(&id, "boundary_distance")));
 
         let moisture = session.slot(&format!("{id}.moisture"));
         let chunk = session.generate(ChunkCoord(128, 128, 0)).unwrap();
@@ -1264,9 +1412,10 @@ mod tests {
             .iter()
             .all(|(c, ..)| (0.0..=1.0).contains(&c[moisture])));
 
-        // Dropping the temperature input removes only that edge.
+        // Dropping inputs removes only their edges.
         let edited = worldgraph::script::TEMPLATE
-            .replace("input: elevation, temperature", "input: elevation")
+            .replace("input: elevation, boundary_distance, temperature", "input: elevation")
+            .replace("this.boundary_distance", "0.0")
             .replace("max(this.temperature - 20.0, 0.0)", "0.0");
         let graph = session.update_script(&id, &edited).unwrap();
         let into: Vec<_> = graph.edges.iter().filter(|e| e.to.node == id).collect();
@@ -1304,7 +1453,7 @@ mod tests {
             .is_err());
 
         assert_eq!(session.pipeline_graph().revision, before);
-        assert_eq!(session.graph_doc().nodes.len(), 4);
+        assert_eq!(session.graph_doc().nodes.len(), 5);
     }
 
     #[test]
@@ -1313,18 +1462,18 @@ mod tests {
         session.add_node("humidity", (0.0, 0.0), None).unwrap();
         let revision = session.pipeline_graph().revision;
 
-        session.move_nodes(&[("n5".into(), (123.0, 45.0))]);
+        session.move_nodes(&[("n6".into(), (123.0, 45.0))]);
         let graph = session.pipeline_graph();
         assert_eq!(graph.revision, revision);
-        assert_eq!(node(&graph, "n5").position, (123.0, 45.0));
+        assert_eq!(node(&graph, "n6").position, (123.0, 45.0));
 
         let saved = session.graph_doc().to_json();
         let reloaded = Session::with_doc(GraphDoc::from_json(&saved).unwrap()).unwrap();
         let again = reloaded.pipeline_graph();
 
         assert_eq!(reloaded.graph_doc(), session.graph_doc());
-        assert_eq!(node(&again, "n5").position, (123.0, 45.0));
-        assert_eq!(node(&again, "n5").status, NodeStatus::Active);
+        assert_eq!(node(&again, "n6").position, (123.0, 45.0));
+        assert_eq!(node(&again, "n6").status, NodeStatus::Active);
         assert_eq!(
             reloaded.world_info().column_fields.len(),
             session.world_info().column_fields.len()
@@ -1338,16 +1487,19 @@ mod tests {
         let ids: Vec<_> = before.iter().map(|t| t.id.as_str()).collect();
 
         assert_eq!(revision, 0);
-        assert_eq!(ids, ["n1", "n2", "n3", "n4"]);
+        // World nodes first, then chunk nodes, then the world sampling.
+        assert_eq!(ids, ["n1", "n2", "n3", "n4", "n5", "world"]);
 
         let coord = ChunkCoord(100, 100, 0);
         session.column_payload(coord).unwrap();
-        session.column_payload(coord).unwrap(); // cache hit: no node runs
+        session.column_payload(coord).unwrap(); // cache hit: nothing runs
 
         let (_, after) = session.step_timings();
-        // Export node n4 has no runtime work.
-        for (old, new) in before.iter().zip(&after).filter(|(t, _)| t.id != "n4") {
-            assert_eq!(new.runs, old.runs + 1);
+        // World nodes run once per world and the export has no runtime work:
+        // only the solid fill and the sampling run per chunk.
+        for (old, new) in before.iter().zip(&after) {
+            let per_chunk = ["n4", "world"].contains(&old.id.as_str());
+            assert_eq!(new.runs, old.runs + u64::from(per_chunk), "{}", old.id);
         }
     }
 
@@ -1359,22 +1511,21 @@ mod tests {
         assert!(session.undo().is_err());
 
         session.add_node("humidity", (10.0, 10.0), None).unwrap();
-        session.move_nodes(&[("n5".into(), (99.0, 77.0))]);
-        session.set_label("n4", "terrain").unwrap();
+        session.move_nodes(&[("n6".into(), (99.0, 77.0))]);
+        session.set_label("n5", "terrain").unwrap();
         let edited = session.graph_doc();
 
         // Moving to where it already is records nothing.
-        session.move_nodes(&[("n5".into(), (99.0, 77.0))]);
+        session.move_nodes(&[("n6".into(), (99.0, 77.0))]);
 
         let graph = session.undo().unwrap();
-        assert_eq!(node(&graph, "n4").label, "height");
-        assert_eq!(node(&graph, "n5").position, (99.0, 77.0));
+        assert_eq!(node(&graph, "n5").label, "height");
+        assert_eq!(node(&graph, "n6").position, (99.0, 77.0));
         let graph = session.undo().unwrap();
-        assert_eq!(node(&graph, "n5").position, (10.0, 10.0));
+        assert_eq!(node(&graph, "n6").position, (10.0, 10.0));
         session.undo().unwrap();
         assert_eq!(session.graph_doc(), original);
         assert!(!session.can_undo());
-        assert_eq!(session.world_info().column_fields.len(), 2);
 
         for _ in 0..3 {
             session.redo().unwrap();
@@ -1384,16 +1535,20 @@ mod tests {
 
         // A new edit drops the redo branch.
         session.undo().unwrap();
-        session.set_enabled("n3", false).unwrap();
+        session.set_enabled("n4", false).unwrap();
         assert!(!session.can_redo());
     }
 
     #[test]
     fn changing_the_seed_rebuilds_the_world_and_is_undoable() {
         let session = Session::new(10).unwrap();
+        session.add_node("slope", (0.0, 0.0), None).unwrap(); // chunk output to compare
         let coord = ChunkCoord(128, 128, 0);
         let before = session.column_payload(coord).unwrap();
-        let (elevation_a, revision) = (session.world().elevation_at(0, 0), session.pipeline_graph().revision);
+        let (elevation_a, revision) = (
+            world_elevation(&session, 0, 0),
+            session.pipeline_graph().revision,
+        );
 
         let graph = session.set_seed(u64::MAX).unwrap();
         let info = session.world_info();
@@ -1401,17 +1556,18 @@ mod tests {
         assert_eq!(graph.revision, revision + 1);
         assert_eq!(info.seed, u64::MAX);
         assert_eq!(session.graph_doc().seed, u64::MAX);
-        assert_ne!(session.world().elevation_at(0, 0), elevation_a);
+        assert_ne!(world_elevation(&session, 0, 0), elevation_a);
         assert_ne!(session.column_payload(coord).unwrap()[40..], before[40..]);
         assert!(serde_json::to_string(&info).unwrap().contains("\"seed\":\"18446744073709551615\""));
 
         // The seed survives a save/load round trip.
-        let reloaded = Session::with_doc(GraphDoc::from_json(&session.graph_doc().to_json()).unwrap()).unwrap();
+        let reloaded =
+            Session::with_doc(GraphDoc::from_json(&session.graph_doc().to_json()).unwrap()).unwrap();
         assert_eq!(reloaded.world_info().seed, u64::MAX);
 
         session.undo().unwrap();
         assert_eq!(session.world_info().seed, 10);
-        assert_eq!(session.world().elevation_at(0, 0), elevation_a);
+        assert_eq!(world_elevation(&session, 0, 0), elevation_a);
         assert_eq!(&session.column_payload(coord).unwrap()[40..], &before[40..]);
 
         // Setting the same seed again is a no-op for history.
@@ -1441,14 +1597,14 @@ mod tests {
 
         assert_eq!(info.exports.len(), 1);
         assert_eq!(info.exports[0].name, "height");
-        assert_eq!(info.exports[0].field, "n1.elevation");
+        assert_eq!(info.exports[0].field, "n2.elevation");
 
-        let graph = session.set_label("n4", "  terrain_height ").unwrap();
+        let graph = session.set_label("n5", "  terrain_height ").unwrap();
         assert_eq!(graph.exports[0].name, "terrain_height");
-        assert_eq!(node(&graph, "n4").label, "terrain_height");
+        assert_eq!(node(&graph, "n5").label, "terrain_height");
 
         // Clearing the label falls back to the default export name.
-        let graph = session.set_label("n4", "").unwrap();
+        let graph = session.set_label("n5", "").unwrap();
         assert_eq!(graph.exports[0].name, worldgraph::pipeline::DEFAULT_EXPORT_NAME);
         assert!(session.set_label("n99", "x").is_err());
     }
@@ -1506,52 +1662,171 @@ mod tests {
         let original = session.graph_doc();
 
         let graph = session
-            .disconnect_many(&[socket("n2", "elevation"), socket("n3", "elevation")])
+            .disconnect_many(&[socket("n3", "elevation"), socket("n4", "elevation")])
             .unwrap();
-        assert!(graph.edges.iter().all(|e| e.to.node != "n2" && e.to.node != "n3"));
-        assert!(session.disconnect_many(&[socket("n2", "elevation")]).is_err());
+        assert!(graph.edges.iter().all(|e| e.to.node != "n3" && e.to.node != "n4"));
+        assert!(session.disconnect_many(&[socket("n3", "elevation")]).is_err());
         session.undo().unwrap();
         assert_eq!(session.graph_doc(), original);
 
-        // Insert a reroute between elevation and temperature.
-        let (id, _) = session.add_node("reroute_column", (100.0, 0.0), None).unwrap();
-        session.connect(socket("n1", "elevation"), socket(&id, "in")).unwrap();
+        // Insert a world reroute between the elevation and temperature.
+        let fields = session.world_info().world_fields.len();
+        let (id, _) = session.add_node("reroute_world", (100.0, 0.0), None).unwrap();
+        session.connect(socket("n2", "elevation"), socket(&id, "in")).unwrap();
         let graph = session
-            .connect(socket(&id, "out"), socket("n2", "elevation"))
+            .connect(socket(&id, "out"), socket("n3", "elevation"))
             .unwrap();
         assert_eq!(node(&graph, &id).status, NodeStatus::Active);
-        assert_eq!(session.world_info().column_fields.len(), 2, "a reroute adds no field");
+        assert_eq!(session.world_info().world_fields.len(), fields, "a reroute adds no field");
 
-        // Splitting an edge keeps the wiring working and undoes in one step.
+        // Splitting a world wire adds a world reroute; undoes in one step.
         let before = session.graph_doc();
         let (split, graph) = session
-            .insert_reroute(socket("n1", "elevation"), socket("n3", "elevation"), (50.0, 50.0))
+            .insert_reroute(socket("n2", "elevation"), socket("n4", "elevation"), (50.0, 50.0))
             .unwrap();
-        assert_eq!(node(&graph, &split).kind, "reroute_column");
+        assert_eq!(node(&graph, &split).kind, "reroute_world");
         assert_eq!(node(&graph, &split).status, NodeStatus::Active);
-        assert!(graph.edges.iter().any(|e| e.from == socket(&split, "out") && e.to == socket("n3", "elevation")));
+        assert!(graph.edges.iter().any(|e| e.from == socket(&split, "out") && e.to == socket("n4", "elevation")));
         assert!(session
-            .insert_reroute(socket("n1", "elevation"), socket("n3", "elevation"), (0.0, 0.0))
+            .insert_reroute(socket("n2", "elevation"), socket("n4", "elevation"), (0.0, 0.0))
             .is_err());
         session.undo().unwrap();
         assert_eq!(session.graph_doc(), before);
 
         // Voxel edges get a voxel reroute.
         let (export, _) = session.add_node("export_voxel", (0.0, 0.0), None).unwrap();
-        session.connect(socket("n3", "solid"), socket(&export, "value")).unwrap();
+        session.connect(socket("n4", "solid"), socket(&export, "value")).unwrap();
         let (voxel, graph) = session
-            .insert_reroute(socket("n3", "solid"), socket(&export, "value"), (0.0, 0.0))
+            .insert_reroute(socket("n4", "solid"), socket(&export, "value"), (0.0, 0.0))
             .unwrap();
         assert_eq!(node(&graph, &voxel).kind, "reroute_voxel");
         assert_eq!(node(&graph, &voxel).status, NodeStatus::Active);
-        assert_eq!(graph.exports.iter().find(|e| e.name == "export").unwrap().field, "n3.solid");
+        assert_eq!(graph.exports.iter().find(|e| e.name == "export").unwrap().field, "n4.solid");
 
-        let chunk = session.generate(ChunkCoord(128, 128, 0)).unwrap();
-        let temperature = session.slot("n2.temperature");
-        assert!(chunk
-            .chunk_data()
-            .columns
+        // The reroute chain still gives finite temperatures and generates chunks.
+        let temperature = session.slot("n3.temperature");
+        let world = session.world();
+        assert!(world.graph().eval(100, -300)[temperature].is_finite());
+        session.generate(ChunkCoord(128, 128, 0)).unwrap();
+    }
+
+    #[test]
+    fn world_nodes_extend_the_overview_and_rebuild_the_world_only_when_needed() {
+        let session = Session::new(6).unwrap();
+        let base = session.world_info();
+        assert_eq!(base.world_fields.len(), 7);
+
+        // A world node adds an overview field and a new world stage.
+        let (noise, graph) = session.add_node("world_noise", (0.0, 0.0), None).unwrap();
+        assert_eq!(node(&graph, &noise).scope, FieldScope::World);
+        let info = session.world_info();
+        assert_eq!(info.world_fields.len(), 8);
+        assert_eq!(info.world_fields.last().unwrap().key, format!("{noise}.noise"));
+        assert_eq!(info.world_generation, base.world_generation + 1);
+
+        // The overview payload carries a plane per field, finite inside the world.
+        let payload = session.world_payload((0, 0), 64, 4, 4).unwrap();
+        let fields = u32::from_le_bytes(payload[12..16].try_into().unwrap()) as usize;
+        assert_eq!(fields, info.world_fields.len());
+        let last = PAYLOAD_HEADER_BYTES + (fields - 1) * 16 * 4;
+        let value = f32::from_le_bytes(payload[last..last + 4].try_into().unwrap());
+        assert!((0.0..=1.0).contains(&value));
+
+        // Chunk-scope edits reuse the world stage; world-scope edits rebuild it.
+        let generation = session.world_info().world_generation;
+        let world = session.world();
+        let (slope, _) = session.add_node("slope", (0.0, 0.0), None).unwrap();
+        session.set_label("n5", "terrain").unwrap();
+        assert!(Arc::ptr_eq(&world, &session.world()));
+        assert_eq!(session.world_info().world_generation, generation);
+
+        // Climate is world scope: changing it rebuilds the world.
+        session.set_param("n3", "equator", 10.0).unwrap();
+        assert!(!Arc::ptr_eq(&world, &session.world()));
+        let generation = session.world_info().world_generation;
+        let world = session.world();
+
+        session.set_param(&noise, "wavelength", 128.0).unwrap();
+        assert!(!Arc::ptr_eq(&world, &session.world()));
+        assert_eq!(session.world_info().world_generation, generation + 1);
+
+        // Wires: world → column connects (sampled per column), column → world does not.
+        let (remap, _) = session.add_node("world_remap", (0.0, 0.0), None).unwrap();
+        assert!(session.connect(socket(&noise, "noise"), socket(&remap, "value")).is_ok());
+        let graph = session.connect(socket(&remap, "remapped"), socket("n3", "elevation")).unwrap();
+        assert_eq!(node(&graph, "n3").status, NodeStatus::Active);
+        assert!(session
+            .connect(socket(&slope, "slope"), socket(&remap, "value"))
+            .unwrap_err()
+            .contains("Cannot connect"));
+        session.generate(ChunkCoord(128, 128, 0)).unwrap();
+
+        // Splitting a world wire adds a world reroute.
+        let (reroute, graph) = session
+            .insert_reroute(socket(&noise, "noise"), socket(&remap, "value"), (0.0, 0.0))
+            .unwrap();
+        assert_eq!(node(&graph, &reroute).kind, "reroute_world");
+        assert_eq!(node(&graph, &reroute).status, NodeStatus::Active);
+
+        // World nodes undo like any edit.
+        while session.can_undo() {
+            session.undo().unwrap();
+        }
+        assert_eq!(session.world_info().world_fields.len(), 7);
+    }
+
+    #[test]
+    fn templates_open_as_worlds_with_ocean_edges_and_report_what_they_made() {
+        let templates = templates();
+        assert!(templates.iter().any(|t| t.id == "single_continent"));
+        assert!(template_doc("nope").is_err());
+
+        // The default world scatters land to the border; continents do not.
+        let session = Session::new(5).unwrap();
+        assert!(session.world_info().world_stats.edge_land > 0.1);
+
+        session.replace_doc(template_doc("single_continent").unwrap()).unwrap();
+        let stats = session.world_info().world_stats;
+        assert_eq!(stats.edge_land, 0.0);
+        assert_eq!(stats.landmasses, 1);
+        assert!(stats.land_fraction > 0.05);
+
+        // A template is a graph like any other: edits and undo work on it.
+        let falloff = session
+            .graph_doc()
+            .nodes
             .iter()
-            .all(|(c, ..)| c[temperature].is_finite()));
+            .find(|n| n.kind == "edge_falloff")
+            .unwrap()
+            .id
+            .clone();
+        session.set_param("n1", "continents", 0.0).unwrap();
+        session.set_param("n1", "continental_fraction", 0.9).unwrap();
+        session.set_param(&falloff, "margin", 0.0).unwrap();
+        session.set_param(&falloff, "falloff", 0.0).unwrap();
+        session.set_param(&falloff, "noise", 0.0).unwrap();
+        assert!(
+            session.world_info().world_stats.edge_land > 0.0,
+            "mostly land and no falloff: land reaches the edge"
+        );
+        for _ in 0..5 {
+            session.undo().unwrap();
+        }
+        assert_eq!(session.world_info().world_stats.edge_land, 0.0);
+    }
+
+    #[test]
+    fn old_format_files_open_through_the_migration() {
+        let old = r#"{"format": 1, "seed": 5,
+            "world": {"plate_size": 1100, "continents": 1, "edge_margin": 0.08, "edge_falloff": 0.14},
+            "nodes": [{"id": "n1", "kind": "elevation"}, {"id": "n2", "kind": "temperature"}],
+            "edges": [{"from": {"node": "n1", "socket": "elevation"}, "to": {"node": "n2", "socket": "elevation"}}]}"#;
+        let session = Session::with_doc(GraphDoc::from_json(old).unwrap()).unwrap();
+
+        assert_eq!(session.graph_doc().format, 2);
+        let graph = session.pipeline_graph();
+        assert!(graph.nodes.iter().all(|n| n.status == NodeStatus::Active));
+        assert_eq!(session.world_info().world_stats.edge_land, 0.0);
+        assert!(!session.graph_doc().to_json().contains("\"world\""));
     }
 }

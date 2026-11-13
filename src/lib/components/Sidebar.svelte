@@ -21,6 +21,7 @@
 	/** Applies a new seed (decimal string); resolves once the world has reloaded. */
 	export let onSeed: (seed: string) => Promise<void> | void = () => {};
 	export let onGoTo: (x: number, y: number) => void = () => {};
+	export let onFitWorld: () => void = () => {};
 	/** Value range of the selected field in view, for "Auto" range. */
 	export let getDataRange: () => [number, number] | null = () => null;
 	/** Disables the seed controls while a graph edit is running. */
@@ -60,6 +61,10 @@
 
 		if (index >= 0) {
 			field = index; // keep the user's ramp and range
+		} else if (world && world.worldFields.some((def) => def.name === 'elevation')) {
+			// The terrain first: the last (filtered) world elevation.
+			const last = world.worldFields.map((def) => def.name).lastIndexOf('elevation');
+			selectField('world', last);
 		} else if (fieldsOf('column').length) {
 			selectField('column', 0);
 		} else {
@@ -184,6 +189,12 @@
 		}
 	}
 
+	// --- World summary --------------------------------------------------------
+
+	$: stats = world?.worldStats;
+	$: landPercent = stats ? Math.round(stats.landFraction * 100) : 0;
+	$: edgeOcean = !!stats && stats.edgeLand === 0;
+
 	// --- Navigation ---------------------------------------------------------
 
 	let goX = 0;
@@ -245,9 +256,15 @@
 				<dd>{world.dimensions[0]} × {world.dimensions[1]}</dd>
 				<dt>Chunk</dt>
 				<dd>{world.chunkSize.join(' × ')}</dd>
-				<dt>Plates</dt>
-				<dd>{world.plateCount}</dd>
 			</dl>
+
+			{#if stats && world.worldFields.length}
+				<p class="stats" class:warn={!edgeOcean}>
+					Land {landPercent}% · {stats.landmasses}
+					{stats.landmasses === 1 ? 'landmass' : 'landmasses'} ·
+					{edgeOcean ? 'ocean on every edge' : `land touches the edge (${Math.round(stats.edgeLand * 100)}%)`}
+				</p>
+			{/if}
 		</SidebarSection>
 
 		<SidebarSection id="view" title="View">
@@ -334,6 +351,9 @@
 			</div>
 			<div class="row">
 				<button class="small" on:click={goTo}>Go to</button>
+				<button class="small" title="Zoom out to see the whole world" on:click={onFitWorld}>
+					Fit world
+				</button>
 				<button
 					class="small"
 					title="Center on the middle of the world"
@@ -377,13 +397,11 @@
 						<dd>{computed(def.key) ? format(hover.column?.[index]) : 'not yet'}</dd>
 					{/each}
 
-					{#if hover.world}
-						<dt>plate</dt>
-						<dd>{hover.world.plate}</dd>
-						<dt>boundary</dt>
-						<dd>{format(hover.world.boundaryDistance)} cells</dd>
-						<dt>convergence</dt>
-						<dd>{format(hover.world.convergence)}</dd>
+					{#if hover.worldValues}
+						{#each world.worldFields as def, index}
+							<dt title="{def.nodeLabel} {def.node}">{def.name} <small>{def.node}</small></dt>
+							<dd>{format(hover.worldValues[index])}</dd>
+						{/each}
 					{:else}
 						<dt>world</dt>
 						<dd>outside</dd>
@@ -515,6 +533,21 @@
 			font-variant-numeric: tabular-nums;
 		}
 	}
+
+
+
+	.stats {
+		font-size: 11px;
+	}
+
+	.stats.warn {
+		color: #e0c27f;
+	}
+
+
+
+
+
 
 	.legend {
 		display: flex;

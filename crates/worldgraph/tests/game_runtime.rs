@@ -28,8 +28,9 @@ fn saved_graph() -> GraphDoc {
 #[test]
 fn game_reads_exports_through_the_bevy_runtime() {
     let config = config();
-    let world = Arc::new(WorldStore::new(&config));
-    let graph = GraphPipeline::build(&saved_graph(), config, &world).unwrap();
+    let doc = saved_graph();
+    let world = Arc::new(WorldStore::for_doc(&doc, &config).unwrap());
+    let graph = GraphPipeline::build(&doc, config, &world).unwrap();
 
     let height = graph.export("height").expect("default graph exports height").clone();
     assert!(graph.analysis().nodes.iter().all(|n| n.reason.is_none()));
@@ -57,21 +58,23 @@ fn game_reads_exports_through_the_bevy_runtime() {
         thread::sleep(Duration::from_millis(1));
     };
 
+    // The `height` export is the terrain elevation, sampled from the world.
+    let elevation = graph.elevation_world_slot().expect("the terrain has an elevation");
     let origin = chunk.origin();
     for (column, x, y, _) in chunk.chunk_data().columns.iter() {
-        let expected = world.elevation_at(origin.0 + x as i64, origin.1 + y as i64);
-        assert_eq!(column[height.slot], expected);
+        let expected = world.graph().eval(origin.0 + x as i64, origin.1 + y as i64)[elevation];
+        assert_eq!(column[height.slot], expected as f32);
     }
 }
 
 #[test]
 fn missing_exports_and_blocked_nodes_are_reported_not_fatal() {
     let mut doc = saved_graph();
-    // Break the graph: drop elevation, which everything depends on.
-    doc.nodes.retain(|n| n.id != "n1");
+    // Break the graph: drop the elevation node, which everything depends on.
+    doc.nodes.retain(|n| n.id != "n2");
 
     let config = config();
-    let world = Arc::new(WorldStore::new(&config));
+    let world = Arc::new(WorldStore::for_doc(&doc, &config).unwrap());
     let graph = GraphPipeline::build(&doc, config, &world).unwrap();
 
     assert!(graph.export("height").is_none());
@@ -79,6 +82,7 @@ fn missing_exports_and_blocked_nodes_are_reported_not_fatal() {
         .analysis()
         .nodes
         .iter()
+        .filter(|n| n.kind != "tectonics")
         .all(|n| n.reason.as_deref().is_some_and(|r| r.contains("not connected"))));
     // Still generates (nothing runs).
     assert!(graph.validate(config, &world).is_ok());

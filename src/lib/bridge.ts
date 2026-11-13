@@ -26,6 +26,8 @@ export interface WorldInfo {
 	seed: string;
 	/** Pipeline revision of this schema; chunk payloads carry it too. */
 	revision: number;
+	/** Changes when the world stage is rebuilt (seed or world nodes). */
+	worldGeneration: number;
 	/** Order matches the field planes in chunk payloads. */
 	columnFields: FieldDef[];
 	voxelFields: FieldDef[];
@@ -33,7 +35,15 @@ export interface WorldInfo {
 	worldFields: FieldDef[];
 	/** Game-facing named outputs (Export nodes). */
 	exports: Export[];
-	plateCount: number;
+	/** Land/ocean facts, read from the terrain's `elevation` world output. */
+	worldStats: {
+		/** 0..1 of the world at or above sea level. */
+		landFraction: number;
+		/** Connected landmasses of meaningful size. */
+		landmasses: number;
+		/** 0..1 of the border samples that are land (0 = ocean all round). */
+		edgeLand: number;
+	};
 }
 
 /** Regular grid of field samples: sample (i, j) is at (originX + i*step, originY + j*step). */
@@ -52,7 +62,16 @@ export interface FieldGrid {
 
 export type NodeStatus = 'active' | 'disabled' | 'blocked';
 /** Socket value types; connections require equal types. */
-export type SocketScope = 'column' | 'voxel';
+/**
+ * Socket types, which are also node scopes: `world` values are computed once
+ * per world and may feed chunk (`column`) inputs (sampled per column);
+ * nothing flows from chunk or voxel scope into world nodes.
+ */
+export type SocketScope = 'world' | 'column' | 'voxel';
+
+/** Can an output of type `from` be wired into an input of type `to`? (Mirrors `can_connect`.) */
+export const canConnect = (from: SocketScope, to: SocketScope) =>
+	from === to || (from === 'world' && to === 'column');
 
 export interface SocketRef {
 	node: string;
@@ -73,6 +92,8 @@ export interface NodeReport {
 	/** User label if set, else the kind's label. Export nodes: the export name. */
 	label: string;
 	kindLabel: string;
+	/** Where the node runs: once per world, per chunk (column) or per voxel. */
+	scope: SocketScope;
 	/** Export node: publishes its input under `label` for game code. */
 	export: boolean;
 	description: string;
@@ -84,7 +105,6 @@ export interface NodeReport {
 	inputs: Array<{ name: string; scope: SocketScope }>;
 	outputs: Array<{ name: string; scope: SocketScope }>;
 	params: ParamReport[];
-	worldReads: string[];
 	/** Rhai script node (editable source). */
 	script: boolean;
 	/** Set on active nodes when the graph has a neighborhood node. */
@@ -129,11 +149,8 @@ export interface PipelineGraph {
 	frames: Frame[];
 	exports: Export[];
 	edges: EdgeReport[];
-	/** Display-only: world model → node that queries it. */
-	worldEdges: Array<{ model: string; to: string }>;
 	/** Built-in node kinds that can be added. */
-	kinds: Array<{ id: string; label: string; description: string }>;
-	worldModels: string[];
+	kinds: Array<{ id: string; label: string; description: string; scope: SocketScope }>;
 }
 
 export const pipelineGraph = () => invoke<PipelineGraph>('pipeline_graph');
@@ -219,13 +236,6 @@ export interface StepTimings {
 }
 export const stepTimings = () => invoke<StepTimings>('step_timings');
 
-export interface WorldSample {
-	plate: number;
-	boundaryDistance: number;
-	convergence: number;
-	elevation: number;
-}
-
 const PAYLOAD_VERSION = 2;
 const HEADER_BYTES = 40;
 
@@ -249,9 +259,20 @@ export async function sampleWorld(
 	);
 }
 
-export function worldPoint(x: number, y: number): Promise<WorldSample | null> {
-	return invoke<WorldSample | null>('world_point', { x, y });
+/** Values of every world field at a column, in `WorldInfo.worldFields` order (null outside the world). */
+export function worldPoint(x: number, y: number): Promise<number[] | null> {
+	return invoke<number[] | null>('world_point', { x, y });
 }
+
+export interface TemplateInfo {
+	id: string;
+	label: string;
+	description: string;
+}
+/** Starting graphs for File → New from template. */
+export const listTemplates = () => invoke<TemplateInfo[]>('list_templates');
+export const newFromTemplate = (id: string) =>
+	invoke<ProjectState | null>('new_from_template', { id });
 
 /** See `encode_planes` in src-tauri/src/generation/mod.rs. */
 export function parseFieldGrid(buffer: ArrayBuffer): FieldGrid {

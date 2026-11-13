@@ -15,6 +15,8 @@
 		disconnectMany,
 		exportCopy,
 		insertReroute,
+		listTemplates,
+		newFromTemplate,
 		graphFile,
 		moveNodes,
 		newProject,
@@ -38,6 +40,7 @@
 		type PipelineGraph as Graph,
 		type ProjectState,
 		type SocketRef,
+		type TemplateInfo,
 		type WorldInfo
 	} from '$lib/bridge';
 
@@ -47,6 +50,7 @@
 	let graph: Graph | null = null;
 	let savedTo: string | null = null;
 	let project: ProjectState | null = null;
+	let templates: TemplateInfo[] = [];
 	let graphBusy = false;
 	let graphError: string | null = null;
 	let showGraph = true;
@@ -98,11 +102,12 @@
 		window.addEventListener('resize', onResize);
 
 		try {
-			[world, graph, savedTo, project] = await Promise.all([
+			[world, graph, savedTo, project, templates] = await Promise.all([
 				worldInfo(),
 				pipelineGraph(),
 				graphFile(),
-				projectState()
+				projectState(),
+				listTemplates()
 			]);
 			visualizer.start(world, callbacks);
 		} catch (error) {
@@ -186,6 +191,7 @@
 
 	const menuActions = {
 		onNew: () => replaceProject(newProject),
+		onNewFromTemplate: (id: string) => replaceProject(() => newFromTemplate(id)),
 		onOpen: () => replaceProject(() => openProject()),
 		onOpenRecent: (path: string) => replaceProject(() => openProject(path)),
 		onSave: () => writeProject(saveProject),
@@ -386,6 +392,7 @@
 <div class="shell">
 <MenuBar
 	{project}
+	{templates}
 	{showGraph}
 	busy={graphBusy}
 	error={showGraph ? null : graphError}
@@ -404,6 +411,7 @@
 		busy={graphBusy}
 		onSeed={(seed) => editGraph(() => setSeed(seed))}
 		onGoTo={(x, y) => visualizer?.goTo(x, y)}
+		onFitWorld={() => visualizer?.fitWorld()}
 		getDataRange={() => visualizer?.dataRange() ?? null}
 	/>
 

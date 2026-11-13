@@ -27,10 +27,7 @@
 	let view: EditorView | null = null;
 
 	const FUNCTIONS = [
-		['world_elevation(x, y)', 'tectonic elevation (cells)'],
-		['world_plate(x, y)', 'plate id'],
-		['world_boundary_distance(x, y)', 'cells to plate boundary'],
-		['world_convergence(x, y)', '>0 collision, <0 rift'],
+		['input: elevation, …', 'world values arrive as inputs'],
 		['latitude(y)', '-1 … 1'],
 		['sea_level(), depth()', 'elevation constants'],
 		['noise(x, y, wavelength)', 'seeded 0 … 1'],

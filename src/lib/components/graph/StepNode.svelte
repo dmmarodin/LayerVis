@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { Handle, Position, useUpdateNodeInternals, type NodeProps } from '@xyflow/svelte';
-	import { WORLD_HANDLE, type StepNodeData } from './types';
+	import type { StepNodeData } from './types';
 
 	let { id, data }: NodeProps & { data: StepNodeData } = $props();
 	let node = $derived(data.node);
@@ -24,6 +24,13 @@
 		if (value.trim() !== node.label) data.onLabel(node.id, value);
 	}
 
+	const SCOPE_LABEL = { world: 'world', column: 'chunk', voxel: 'voxel' } as const;
+	const SCOPE_HELP = {
+		world: 'World node: runs once when the world is created, then read-only. Can only read other world nodes.',
+		column: 'Chunk node: runs per chunk column. Can read world and chunk values.',
+		voxel: 'Voxel node: runs per cell. Can read world, chunk and voxel values.'
+	} as const;
+
 	const STAGE_HELP = {
 		prefix: 'Needed by the neighborhood node: re-run for each neighbor chunk (cached when it only writes column outputs).',
 		neighborhood: 'Cross-chunk node: reads prefix data of neighboring chunks within its radius (X×Y×Z cells).',
@@ -32,22 +39,13 @@
 </script>
 
 <div
-	class="step-node {node.status}"
+	class="step-node {node.status} scope-{node.scope}"
 	class:script={node.script}
 	class:selected={data.selected}
 	title={node.status === 'active'
 		? `${node.description}\nClick to view the map after this node.`
 		: node.description}
 >
-	<!-- World-model edges (display only) attach here. -->
-	<Handle
-		type="target"
-		position={Position.Top}
-		id={WORLD_HANDLE}
-		isConnectable={false}
-		class="world-handle"
-	/>
-
 	<header>
 		<input
 			type="checkbox"
@@ -136,6 +134,7 @@
 	{/if}
 
 	<footer>
+		<span class="scope-tag {node.scope}" title={SCOPE_HELP[node.scope]}>{SCOPE_LABEL[node.scope]}</span>
 		{#if node.stage}
 			<span class="stage {node.stage}" title={STAGE_HELP[node.stage]}>
 				{node.stage}{node.neighborhood ? ` · r ${node.neighborhood.join('×')}` : ''}
@@ -279,9 +278,34 @@
 		background: #e0a24f;
 	}
 
-	.step-node :global(.world-handle) {
-		opacity: 0;
-		pointer-events: none;
+	.socket :global(.handle.world) {
+		background: #b58cf0;
+	}
+
+	.scope-tag {
+		padding: 0 6px;
+		border-radius: 8px;
+		font-size: 10px;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		border: 1px solid currentColor;
+	}
+
+	.scope-tag.world {
+		color: #b58cf0;
+	}
+
+	.scope-tag.column {
+		color: #6fa8ff;
+	}
+
+	.scope-tag.voxel {
+		color: #e0a24f;
+	}
+
+	/* World nodes run once per world, not per chunk. */
+	.step-node.scope-world {
+		border-left: 3px solid #b58cf0;
 	}
 
 	.params {

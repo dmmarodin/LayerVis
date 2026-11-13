@@ -1,17 +1,18 @@
 import { Context } from './context';
+import { MAX_ZOOM, MIN_ZOOM } from './camera';
 import { SceneManager } from './scene';
 import type { RenderView, ViewMode } from './fieldMaterial';
 import { ChunkStreamer, type StreamStats } from './streaming';
 import { WorldOverlay, type OverlayStats } from './overlay';
-import { worldPoint, type WorldInfo, type WorldSample } from '../bridge';
+import { worldPoint, type WorldInfo } from '../bridge';
 
 export interface HoverInfo {
 	x: number;
 	y: number;
 	/** Column field values from the loaded chunk, in columnFields order. */
 	column: number[] | null;
-	/** Exact world-model values at the column (null outside the world). */
-	world: WorldSample | null;
+	/** Values of every world field at the column, in `worldFields` order (null outside the world). */
+	worldValues: number[] | null;
 }
 
 export interface VisualizerCallbacks {
@@ -19,6 +20,9 @@ export interface VisualizerCallbacks {
 	onOverlay: (stats: OverlayStats) => void;
 	onHover: (hover: HoverInfo | null) => void;
 }
+
+/** Identity of the world stage: what the world overlay samples depend on. */
+const worldKey = (world: WorldInfo) => `${world.seed}|${world.worldGeneration}`;
 
 // Public facing API for the visualizer
 export class Visualizer {
@@ -61,8 +65,9 @@ export class Visualizer {
 		const scene = Context.getInstance().scene;
 
 		this.streamer?.dispose();
-		// A new seed changes the world models too, not just the pipeline.
-		if (this.world && this.world.seed !== world.seed) this.overlay?.invalidate();
+		// A new seed or changed world nodes change the world too, not just the
+		// pipeline.
+		if (this.world && worldKey(this.world) !== worldKey(world)) this.overlay?.invalidate();
 		this.world = world;
 		this.callbacks = callbacks;
 		this.streamer = new ChunkStreamer(world, scene, () => this.view, callbacks.onStream);
@@ -94,6 +99,22 @@ export class Visualizer {
 	public goTo(x: number, y: number): void {
 		const camera = Context.getInstance().camera;
 		camera.position.set(x, y, camera.position.z);
+		camera.notifyChange();
+	}
+
+	/** Centers the camera and zooms out until the whole world is in view. */
+	public fitWorld(): void {
+		if (!this.world) return;
+		const camera = Context.getInstance().camera;
+		const [width, height] = this.world.dimensions;
+		const [ox, oy] = this.world.origin;
+
+		// Visible span at zoom 1; a little breathing room around the world.
+		const spanX = camera.right - camera.left;
+		const spanY = camera.top - camera.bottom;
+		camera.zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, Math.min(spanX / width, spanY / height) / 1.05));
+		camera.updateProjectionMatrix();
+		camera.position.set(ox + width / 2, oy + height / 2, camera.position.z);
 		camera.notifyChange();
 	}
 
@@ -182,9 +203,9 @@ export class Visualizer {
 		this.hoverInFlight = true;
 
 		try {
-			const world = await worldPoint(x, y);
+			const worldValues = await worldPoint(x, y);
 			const column = this.streamer?.columnValuesAt(x, y) ?? null;
-			this.callbacks.onHover({ x, y, column, world });
+			this.callbacks.onHover({ x, y, column, worldValues });
 		} catch (error) {
 			console.error('world_point failed', error);
 		} finally {

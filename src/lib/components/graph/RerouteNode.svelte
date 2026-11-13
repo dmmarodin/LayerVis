@@ -44,6 +44,14 @@
 		background: #6fa8ff;
 	}
 
+	.reroute :global(.handle.world) {
+		background: #b58cf0;
+	}
+
+	.reroute.world {
+		border-color: #b58cf0;
+	}
+
 	.reroute :global(.handle.voxel) {
 		background: #e0a24f;
 	}

@@ -1,12 +1,14 @@
 <script lang="ts">
-	import type { ProjectState } from '$lib/bridge';
+	import type { ProjectState, TemplateInfo } from '$lib/bridge';
 
 	interface Props {
 		project: ProjectState | null;
+		templates?: TemplateInfo[];
 		showGraph: boolean;
 		busy?: boolean;
 		error?: string | null;
 		onNew: () => void;
+		onNewFromTemplate?: (id: string) => void;
 		onOpen: () => void;
 		onOpenRecent: (path: string) => void;
 		onSave: () => void;
@@ -20,10 +22,12 @@
 
 	let {
 		project,
+		templates = [],
 		showGraph,
 		busy = false,
 		error = null,
 		onNew,
+		onNewFromTemplate = () => {},
 		onOpen,
 		onOpenRecent,
 		onSave,
@@ -37,7 +41,14 @@
 
 	type MenuId = 'file' | 'edit' | 'view';
 	type Item =
-		| { kind: 'item'; label: string; shortcut?: string; disabled?: boolean; run: () => void }
+		| {
+				kind: 'item';
+				label: string;
+				title?: string;
+				shortcut?: string;
+				disabled?: boolean;
+				run: () => void;
+		  }
 		| { kind: 'separator' }
 		| { kind: 'header'; label: string };
 
@@ -51,6 +62,16 @@
 			const items: Item[] = [
 				{ kind: 'item', label: 'New project', shortcut: 'Ctrl+N', run: onNew },
 				{ kind: 'item', label: 'Open…', shortcut: 'Ctrl+O', run: onOpen },
+				{ kind: 'separator' },
+				{ kind: 'header', label: 'New from template' },
+				...templates.map(
+					(template): Item => ({
+						kind: 'item',
+						label: template.label,
+						title: template.description,
+						run: () => onNewFromTemplate(template.id)
+					})
+				),
 				{ kind: 'separator' },
 				{ kind: 'item', label: 'Save', shortcut: 'Ctrl+S', run: onSave },
 				{ kind: 'item', label: 'Save as…', shortcut: 'Ctrl+Shift+S', run: onSaveAs },
@@ -134,6 +155,7 @@
 							<button
 								class="item"
 								role="menuitem"
+								title={item.title}
 								disabled={item.disabled || busy}
 								onclick={() => choose(item)}
 							>

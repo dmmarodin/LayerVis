@@ -9,12 +9,10 @@
 		type Node
 	} from '@xyflow/svelte';
 	import '@xyflow/svelte/dist/style.css';
-	import { stepTimings, type PipelineGraph, type SocketRef } from '$lib/bridge';
+	import { canConnect, stepTimings, type PipelineGraph, type SocketRef } from '$lib/bridge';
 	import StepNode from './StepNode.svelte';
-	import WorldNode from './WorldNode.svelte';
 	import FrameNode from './FrameNode.svelte';
 	import RerouteNode from './RerouteNode.svelte';
-	import { WORLD_HANDLE } from './types';
 
 	interface Props {
 		graph: PipelineGraph | null;
@@ -66,11 +64,17 @@
 
 	const nodeTypes = {
 		step: StepNode,
-		world: WorldNode,
 		frame: FrameNode,
 		reroute: RerouteNode
 	};
 	const isReroute = (kind: string) => kind.startsWith('reroute_');
+
+	/** Node kinds by where they run, for the Add node list. */
+	const SCOPE_GROUPS = [
+		{ scope: 'world', label: 'World (once per world)' },
+		{ scope: 'column', label: 'Chunk (per column)' },
+		{ scope: 'voxel', label: 'Voxel (per cell)' }
+	] as const;
 	const TIMING_POLL_MS = 1000;
 
 	let nodes = $state.raw<Node[]>([]);
@@ -157,10 +161,9 @@
 	/** Client-side check while dragging; the backend re-validates (incl. cycles). */
 	function isValidConnection(connection: Edge | Connection): boolean {
 		if (connection.source === connection.target) return false;
-		if (connection.targetHandle === WORLD_HANDLE) return false;
 		const from = scopeOf(connection.source, connection.sourceHandle, true);
 		const to = scopeOf(connection.target, connection.targetHandle, false);
-		return from !== null && from === to;
+		return from !== null && to !== null && canConnect(from, to);
 	}
 
 	/** Connections apply only once the backend accepts them. */
@@ -180,7 +183,7 @@
 			.filter((n) => n.type === 'step' || n.type === 'reroute' || n.type === 'frame')
 			.map((n) => n.id);
 		const inputs = cut
-			.filter((e) => e.targetHandle && e.targetHandle !== WORLD_HANDLE && !ids.includes(e.target))
+			.filter((e) => e.targetHandle && !ids.includes(e.target))
 			.map((e) => ({ node: e.target, socket: e.targetHandle! }));
 
 		if (ids.length) onRemove(ids);
@@ -196,7 +199,7 @@
 	/** Right-click a wire: split it with a reroute at its midpoint. */
 	function onEdgeContextMenu({ edge, event }: { edge: Edge; event: MouseEvent }) {
 		event.preventDefault();
-		if (!edge.sourceHandle || !edge.targetHandle || edge.targetHandle === WORLD_HANDLE) return;
+		if (!edge.sourceHandle || !edge.targetHandle) return;
 
 		const at = (id: string) => graph?.nodes.find((n) => n.id === id)?.position;
 		const from = at(edge.source);
@@ -286,18 +289,7 @@
 	}
 
 	function build(graph: PipelineGraph): [Node[], Edge[]] {
-		const minX = Math.min(0, ...graph.nodes.map((n) => n.position[0]));
-		const minY = Math.min(0, ...graph.nodes.map((n) => n.position[1]));
-
 		const nodes: Node[] = [
-			...graph.worldModels.map((model, index) => ({
-				id: `world:${model}`,
-				type: 'world',
-				position: { x: minX - 260, y: minY + index * 80 },
-				data: { model },
-				deletable: false,
-				connectable: false
-			})),
 			...graph.nodes.map((node) => ({
 				id: node.id,
 				type: isReroute(node.kind) ? 'reroute' : 'step',
@@ -331,7 +323,7 @@
 
 		const status = new Map(graph.nodes.map((n) => [n.id, n.status]));
 		const live = (from: string, to: string) =>
-			(from.startsWith('world:') || status.get(from) === 'active') && status.get(to) === 'active';
+			status.get(from) === 'active' && status.get(to) === 'active';
 
 		const edges: Edge[] = [
 			...graph.edges.map((edge) => ({
@@ -347,15 +339,6 @@
 					: live(edge.from.node, edge.to.node)
 						? undefined
 						: 'stroke-dasharray: 4 4; opacity: 0.5;'
-			})),
-			...graph.worldEdges.map((edge) => ({
-				id: `world:${edge.model}->${edge.to}`,
-				source: `world:${edge.model}`,
-				target: edge.to,
-				targetHandle: WORLD_HANDLE,
-				deletable: false,
-				selectable: false,
-				style: 'stroke: #6b7aa6; stroke-dasharray: 2 6; opacity: 0.6;'
 			}))
 		];
 
@@ -379,8 +362,15 @@
 
 		{#if graph?.kinds.length}
 			<select bind:value={toAdd} disabled={busy}>
-				{#each graph.kinds as kind}
-					<option value={kind.id} title={kind.description}>{kind.label}</option>
+				{#each SCOPE_GROUPS as group}
+					{@const kinds = graph.kinds.filter((kind) => kind.scope === group.scope)}
+					{#if kinds.length}
+						<optgroup label={group.label}>
+							{#each kinds as kind}
+								<option value={kind.id} title={kind.description}>{kind.label}</option>
+							{/each}
+						</optgroup>
+					{/if}
 				{/each}
 			</select>
 			<button disabled={busy || !toAdd} onclick={() => onAdd(toAdd, ...freeSpot())}>
@@ -469,6 +459,10 @@
 
 	.flow :global(.svelte-flow__edge.column path) {
 		stroke: #6fa8ff;
+	}
+
+	.flow :global(.svelte-flow__edge.world path) {
+		stroke: #b58cf0;
 	}
 
 	.flow :global(.svelte-flow__edge.voxel path) {

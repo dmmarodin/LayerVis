@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use generation::{CacheStats, PipelineGraph, Session, StepTiming, WorldInfo, WorldSample};
+use generation::{CacheStats, PipelineGraph, Session, StepTiming, WorldInfo};
 use worldgraph::{GraphDoc, SocketRef, DEFAULT_SEED};
 use layergen::ChunkCoord;
 use serde::{Deserialize, Serialize};
@@ -136,7 +136,7 @@ async fn sample_world(
 }
 
 #[tauri::command]
-fn world_point(session: State<'_, SharedSession>, x: i64, y: i64) -> Option<WorldSample> {
+fn world_point(session: State<'_, SharedSession>, x: i64, y: i64) -> Option<Vec<f64>> {
     session.world_point(x, y)
 }
 
@@ -455,15 +455,13 @@ fn load_into_session(
     Ok(describe(&session, &project))
 }
 
-fn do_new(window: &WebviewWindow) -> Result<Option<ProjectState>, String> {
+/// A new untitled project from a doc (the default graph or a template).
+fn do_new(window: &WebviewWindow, doc: GraphDoc) -> Result<Option<ProjectState>, String> {
     if !may_discard(window) {
         return Ok(None);
     }
 
-    load_into_session(window, worldgraph::steps::default_graph(), |project, _| {
-        project.mark_new()
-    })
-    .map(Some)
+    load_into_session(window, doc, |project, doc| project.mark_new(doc)).map(Some)
 }
 
 fn do_open(window: &WebviewWindow, path: Option<PathBuf>) -> Result<Option<ProjectState>, String> {
@@ -551,7 +549,20 @@ fn project_state(
 /// Starts an untitled project from the default graph. `None` = cancelled.
 #[tauri::command]
 async fn new_project(window: WebviewWindow) -> Result<Option<ProjectState>, String> {
-    blocking(move || do_new(&window)).await
+    blocking(move || do_new(&window, worldgraph::steps::default_graph())).await
+}
+
+/// The starting graphs offered by File → New from template.
+#[tauri::command]
+fn list_templates() -> Vec<generation::TemplateInfo> {
+    generation::templates()
+}
+
+/// Starts an untitled project from a template. `None` = cancelled.
+#[tauri::command]
+async fn new_from_template(window: WebviewWindow, id: String) -> Result<Option<ProjectState>, String> {
+    let doc = generation::template_doc(&id)?;
+    blocking(move || do_new(&window, doc)).await
 }
 
 /// Opens a project file: `path`, or one picked in a dialog. `None` = cancelled.
@@ -662,6 +673,8 @@ pub fn run() {
             save_project_as,
             export_copy,
             set_seed,
+            list_templates,
+            new_from_template,
             undo,
             redo
         ])

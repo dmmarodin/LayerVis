@@ -39,17 +39,17 @@ const MAX_OPERATIONS: u64 = 200_000;
 
 pub const TEMPLATE: &str = r#"//! name: Moisture
 //! description: Wet near the sea and plate boundaries, drier when high or hot.
-//! input: elevation, temperature
+//! input: elevation, boundary_distance, temperature
 //! output: moisture 0..1 thermal
 //
 // Runs once per column. `this` holds x, y (global cells) and the values
 // wired into each input; assign every output. Use float literals (0.0).
 // New nodes auto-connect inputs to existing outputs with the same name;
-// rewire freely in the graph.
+// rewire freely in the graph. World values (elevation, plate,
+// boundary_distance, convergence, ...) arrive through inputs: wire a world
+// node's output to an input and it is sampled at every column.
 //
-// World:   world_elevation(x, y), world_plate(x, y),
-//          world_boundary_distance(x, y), world_convergence(x, y),
-//          latitude(y), sea_level(), depth(), noise(x, y, wavelength)
+// World:   latitude(y), sea_level(), depth(), noise(x, y, wavelength)
 // Math:    clamp(v, lo, hi), lerp(a, b, t), smoothstep(e0, e1, x), min, max
 
 fn column() {
@@ -59,7 +59,7 @@ fn column() {
     }
 
     let altitude = (this.elevation - sea_level()) / (depth() - sea_level());
-    let near_boundary = 1.0 - smoothstep(0.0, 300.0, world_boundary_distance(this.x, this.y));
+    let near_boundary = 1.0 - smoothstep(0.0, 300.0, this.boundary_distance);
     let heat = max(this.temperature - 20.0, 0.0);
 
     this.moisture = clamp(
@@ -167,12 +167,6 @@ impl ScriptDef {
             return Err("script must define `fn column()` (no parameters)".to_owned());
         }
 
-        let world_reads = if source.contains("world_") {
-            vec!["tectonics".to_owned()]
-        } else {
-            Vec::new()
-        };
-
         Ok(Self {
             source: source.to_owned(),
             contract: Contract {
@@ -187,7 +181,6 @@ impl ScriptDef {
                     .collect(),
                 outputs: writes,
                 params: Vec::new(),
-                world_reads,
                 // Script nodes are per-column only for now.
                 neighborhood: None,
                 export: false,
@@ -345,24 +338,6 @@ fn make_engine(world: Arc<WorldStore>) -> Engine {
     engine.set_max_call_levels(32);
 
     let w = Arc::clone(&world);
-    engine.register_fn("world_elevation", move |x: INT, y: INT| w.elevation_at(x, y) as FLOAT);
-    let w = Arc::clone(&world);
-    engine.register_fn("world_elevation", move |x: FLOAT, y: FLOAT| {
-        w.elevation_at(x.floor() as i64, y.floor() as i64) as FLOAT
-    });
-
-    let w = Arc::clone(&world);
-    engine.register_fn("world_plate", move |x: INT, y: INT| w.sample(x, y).plate as INT);
-    let w = Arc::clone(&world);
-    engine.register_fn("world_boundary_distance", move |x: INT, y: INT| {
-        w.sample(x, y).boundary_distance as FLOAT
-    });
-    let w = Arc::clone(&world);
-    engine.register_fn("world_convergence", move |x: INT, y: INT| {
-        w.sample(x, y).convergence as FLOAT
-    });
-
-    let w = Arc::clone(&world);
     engine.register_fn("latitude", move |y: INT| w.latitude_at(y) as FLOAT);
     let w = Arc::clone(&world);
     engine.register_fn("sea_level", move || w.sea_level() as FLOAT);
@@ -396,12 +371,11 @@ mod tests {
         let inputs: Vec<_> = def.contract.inputs.iter().map(|i| i.name.as_ref()).collect();
 
         assert_eq!(def.contract.label, "Moisture");
-        assert_eq!(inputs, ["elevation", "temperature"]);
+        assert_eq!(inputs, ["elevation", "boundary_distance", "temperature"]);
         assert_eq!(def.contract.outputs.len(), 1);
         assert_eq!(def.contract.outputs[0].name, "moisture");
         assert_eq!(def.contract.outputs[0].ramp, "thermal");
         assert_eq!((def.contract.outputs[0].min, def.contract.outputs[0].max), (0.0, 1.0));
-        assert_eq!(def.contract.world_reads, ["tectonics"]);
     }
 
     #[test]

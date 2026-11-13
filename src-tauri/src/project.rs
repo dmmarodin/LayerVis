@@ -120,10 +120,10 @@ impl Project {
         self.mark_saved(path, doc);
     }
 
-    /// New project: untitled, default graph.
-    pub fn mark_new(&mut self) {
+    /// New project: untitled, starting from `doc` (not modified yet).
+    pub fn mark_new(&mut self, doc: GraphDoc) {
         self.path = None;
-        self.saved = Some(worldgraph::steps::default_graph());
+        self.saved = Some(doc);
     }
 
     pub fn touch_recent(&mut self, path: &Path) {

@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 
 /// Seed of documents that do not store one (and of new projects).
 pub const DEFAULT_SEED: u64 = 12345;
@@ -22,6 +22,10 @@ pub struct GraphDoc {
     /// hand-written ones get `DEFAULT_SEED`), so still `format: 1`.
     #[serde(default = "default_seed")]
     pub seed: u64,
+    /// Format 1 only: the old built-in world parameters. Read so old files
+    /// can be upgraded (they become node params, see `migrate`), never written.
+    #[serde(default, skip_serializing)]
+    pub world: BTreeMap<String, f64>,
     pub nodes: Vec<NodeDoc>,
     pub edges: Vec<EdgeDoc>,
     /// Editor annotations (labelled boxes around nodes). Layout only: they
@@ -95,7 +99,7 @@ pub struct EdgeDoc {
 
 impl GraphDoc {
     pub fn from_json(text: &str) -> Result<Self, String> {
-        let doc: Self = serde_json::from_str(text).map_err(|e| format!("invalid graph file: {e}"))?;
+        let mut doc: Self = serde_json::from_str(text).map_err(|e| format!("invalid graph file: {e}"))?;
 
         if doc.format > FORMAT {
             return Err(format!(
@@ -104,7 +108,6 @@ impl GraphDoc {
             ));
         }
 
-        // Format 1 is the first format: no migrations yet.
         let mut ids = std::collections::HashSet::new();
         for node in &doc.nodes {
             if !ids.insert(node.id.as_str()) {
@@ -118,6 +121,9 @@ impl GraphDoc {
                 return Err(format!("duplicate id `{}`", frame.id));
             }
         }
+
+        // Older files are upgraded in place (after validation, before use).
+        crate::migrate::upgrade(&mut doc);
 
         Ok(doc)
     }
@@ -177,8 +183,8 @@ mod tests {
     #[test]
     fn round_trips_and_defaults_optional_fields() {
         let text = r#"{
-            "format": 1,
-            "nodes": [{ "id": "n1", "kind": "elevation" }],
+            "format": 2,
+            "nodes": [{ "id": "n1", "kind": "tectonics" }],
             "edges": []
         }"#;
         let doc = GraphDoc::from_json(text).unwrap();
@@ -187,6 +193,9 @@ mod tests {
         assert_eq!(doc.nodes[0].position, (0.0, 0.0));
         assert_eq!(doc.seed, DEFAULT_SEED);
         assert!(doc.frames.is_empty());
+        assert!(doc.world.is_empty());
+        assert!(!doc.to_json().contains("\"world\""), "the legacy world block is never written");
+        assert_eq!(doc.format, FORMAT);
         assert!(!doc.to_json().contains("frames"), "empty frames are not written");
 
         let seeded = GraphDoc {

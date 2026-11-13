@@ -1,64 +1,90 @@
-//! World stage: small analytic world models built once per seed.
+//! World stage: the shared data `D` every chunk job reads.
 //!
-//! Must stay analytic (no world-sized allocations): worlds are DF-sized.
-//! Every world field is a pure function of (x, y), so the same function feeds
-//! chunk steps and zoomed-out world views.
+//! A [`WorldStore`] is built once when a world is created. What it holds is
+//! the compiled world-scope nodes of the graph (tectonics, elevation filters,
+//! noise, …, see `terrain.rs` and `steps.rs`): pure functions of `(x, y)`,
+//! read-only afterwards, with no world-sized allocations (worlds are
+//! DF-sized). Chunk nodes read world values through implicit sampling.
 
 use layergen::PipelineConfig;
 use serde::Serialize;
 
-use crate::tectonics::Tectonics;
+use crate::{
+    graph::GraphDoc,
+    pipeline::{
+        analyze, build_world_graph, resolve, world_signature, ResolvedNode, WorldBuildContext,
+        WorldGraph, EMPTY_WORLD_SIGNATURE,
+    },
+};
 
-pub const PLATE_COUNT: usize = 30;
+/// Upper bound on plate ids (the `plate` field's display range).
+pub const MAX_PLATES: usize = 256;
 
-/// LayerGen shared data `D`. Holds every world model for one seed.
+/// Coarse facts about a world, for editor feedback and tests.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorldStats {
+    /// Fraction of the world at or above sea level.
+    pub land_fraction: f64,
+    /// Connected landmasses of meaningful size (tiny islets are ignored).
+    pub landmasses: usize,
+    /// Fraction of the world's border samples that are land (0 = ocean all round).
+    pub edge_land: f64,
+}
+
+/// LayerGen shared data `D`: the world stage of one seed and graph.
 pub struct WorldStore {
     world_min: (i64, i64, i64),
     world_size: (u32, u32, u32),
     seed: u64,
-    pub tectonics: Tectonics,
-}
-
-/// All world fields at one (x, y). Order of `values()` matches `world_fields()`.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorldSample {
-    pub plate: f32,
-    pub boundary_distance: f32,
-    pub convergence: f32,
-    pub elevation: f32,
-}
-
-impl WorldSample {
-    pub const FIELD_COUNT: usize = 4;
-
-    pub fn values(&self) -> [f32; Self::FIELD_COUNT] {
-        [
-            self.plate,
-            self.boundary_distance,
-            self.convergence,
-            self.elevation,
-        ]
-    }
+    /// The compiled world-scope nodes of the graph (see `for_doc`).
+    graph: WorldGraph,
+    /// `world_signature` of the doc `graph` was compiled from.
+    signature: String,
 }
 
 impl WorldStore {
+    /// A world without world nodes (nothing to sample).
     pub fn new(config: &PipelineConfig) -> Self {
-        let world = config.world();
-        let origin = world.origin();
-        let size = world.dimensions();
+        let bounds = config.world();
 
         Self {
-            world_min: origin,
-            world_size: size,
+            world_min: bounds.origin(),
+            world_size: bounds.dimensions(),
             seed: config.seed(),
-            tectonics: Tectonics::generate(
-                config.seed(),
-                (origin.0, origin.1),
-                (size.0, size.1),
-                PLATE_COUNT,
-            ),
+            graph: WorldGraph::default(),
+            signature: EMPTY_WORLD_SIGNATURE.to_owned(),
         }
+    }
+
+    /// The world a graph doc defines: its seed is `config`'s seed (callers
+    /// build the config from `doc.seed`) and its world-scope nodes are
+    /// compiled here, once. `GraphPipeline::build` refuses a world that was
+    /// built from different world nodes.
+    pub fn for_doc(doc: &GraphDoc, config: &PipelineConfig) -> Result<Self, String> {
+        let mut store = Self::new(config);
+
+        let resolved: Vec<ResolvedNode> = doc.nodes.iter().map(resolve).collect();
+        let analysis = analyze(doc, &resolved);
+        let context = WorldBuildContext {
+            seed: config.seed(),
+            origin: (store.world_min.0, store.world_min.1),
+            size: (store.world_size.0, store.world_size.1),
+            depth: store.world_size.2,
+        };
+
+        store.graph = build_world_graph(doc, &resolved, &analysis, &context)?;
+        store.signature = world_signature(doc);
+        Ok(store)
+    }
+
+    /// The compiled world-scope nodes (empty for `new`).
+    pub fn graph(&self) -> &WorldGraph {
+        &self.graph
+    }
+
+    pub fn signature(&self) -> &str {
+        &self.signature
     }
 
     pub fn contains_column(&self, x: i64, y: i64) -> bool {
@@ -66,57 +92,6 @@ impl WorldStore {
             && y >= self.world_min.1
             && x < self.world_min.0 + i64::from(self.world_size.0)
             && y < self.world_min.1 + i64::from(self.world_size.1)
-    }
-
-    pub fn sample(&self, x: i64, y: i64) -> WorldSample {
-        let plates = self.tectonics.plates();
-        let tectonic = self.tectonics.sample(x, y);
-        let depth = f64::from(self.world_size.2);
-
-        let base = |index: usize| if plates[index].continental { 0.55 } else { 0.22 };
-
-        // Blend plate base heights near the boundary to avoid cliffs.
-        let own = base(tectonic.plate);
-        let blend = smoothstep(0.0, 180.0, tectonic.boundary_distance);
-        let mut height = (own + base(tectonic.neighbor)) / 2.0 * (1.0 - blend) + own * blend;
-
-        // Boundary effects fall off with distance from the boundary.
-        let falloff = (-tectonic.boundary_distance / 160.0).exp();
-        let conv = tectonic.convergence;
-        let both_continental =
-            plates[tectonic.plate].continental && plates[tectonic.neighbor].continental;
-        let any_continental =
-            plates[tectonic.plate].continental || plates[tectonic.neighbor].continental;
-
-        if conv > 0.0 {
-            let strength = if both_continental {
-                0.32
-            } else if any_continental {
-                0.22
-            } else {
-                0.10
-            };
-            height += conv * strength * falloff;
-        } else if plates[tectonic.plate].continental {
-            height += conv * 0.10 * falloff; // continental rift
-        } else {
-            height -= conv * 0.05 * falloff; // mid-ocean ridge
-        }
-
-        let detail = f64::from(fbm(self.seed, x as f64, y as f64, 96.0, 4)) - 0.5;
-        height += detail * 0.12;
-
-        WorldSample {
-            plate: tectonic.plate as f32,
-            boundary_distance: tectonic.boundary_distance.min(1e6) as f32,
-            convergence: conv as f32,
-            elevation: (height * depth).clamp(0.0, depth - 1.0) as f32,
-        }
-    }
-
-    /// Terrain elevation in cells, in [0, world depth).
-    pub fn elevation_at(&self, x: i64, y: i64) -> f32 {
-        self.sample(x, y).elevation
     }
 
     /// World depth in cells (elevation range).
@@ -147,9 +122,73 @@ impl WorldStore {
 
         (t * 2.0 - 1.0) as f32
     }
+
+    /// Land fraction, landmass count and border land on a coarse grid
+    /// (`resolution` samples per side), reading the world slot `elevation`
+    /// (an elevation field in cells). Cheap enough to run per world.
+    pub fn stats(&self, elevation: usize, resolution: usize) -> WorldStats {
+        let n = resolution.max(4);
+        let (w, h) = (f64::from(self.world_size.0), f64::from(self.world_size.1));
+        let sea = f64::from(self.sea_level());
+
+        let land: Vec<bool> = (0..n * n)
+            .map(|i| {
+                let x = self.world_min.0 + (((i % n) as f64 + 0.5) / n as f64 * w) as i64;
+                let y = self.world_min.1 + (((i / n) as f64 + 0.5) / n as f64 * h) as i64;
+                self.graph.eval(x, y)[elevation] >= sea
+            })
+            .collect();
+
+        let land_cells = land.iter().filter(|&&l| l).count();
+        let border: Vec<bool> = (0..n)
+            .flat_map(|i| [(i, 0), (i, n - 1), (0, i), (n - 1, i)])
+            .map(|(x, y)| land[x + y * n])
+            .collect();
+
+        // 4-connected components; islets under 0.4% of the map do not count.
+        let min_cells = (n * n / 250).max(2);
+        let mut seen = vec![false; n * n];
+        let mut landmasses = 0;
+
+        for start in 0..n * n {
+            if !land[start] || seen[start] {
+                continue;
+            }
+            let mut size = 0;
+            let mut stack = vec![start];
+            seen[start] = true;
+
+            while let Some(cell) = stack.pop() {
+                size += 1;
+                let (cx, cy) = (cell % n, cell / n);
+                let neighbors = [
+                    (cx > 0).then(|| cell - 1),
+                    (cx + 1 < n).then(|| cell + 1),
+                    (cy > 0).then(|| cell - n),
+                    (cy + 1 < n).then(|| cell + n),
+                ];
+                for next in neighbors.into_iter().flatten() {
+                    if land[next] && !seen[next] {
+                        seen[next] = true;
+                        stack.push(next);
+                    }
+                }
+            }
+
+            if size >= min_cells {
+                landmasses += 1;
+            }
+        }
+
+        WorldStats {
+            land_fraction: land_cells as f64 / (n * n) as f64,
+            landmasses,
+            edge_land: border.iter().filter(|&&l| l).count() as f64 / border.len() as f64,
+        }
+    }
 }
 
-fn smoothstep(edge0: f64, edge1: f64, x: f64) -> f64 {
+pub(crate) fn smoothstep(edge0: f64, edge1: f64, x: f64) -> f64 {
     let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
@@ -226,3 +265,4 @@ pub(crate) fn fbm(seed: u64, x: f64, y: f64, wavelength: f64, octaves: u32) -> f
 
     (total / norm) as f32
 }
+
