@@ -73,6 +73,9 @@ reading the same name.
   (`column` or `voxel`). Dangling or mistyped edges are reported, not fatal.
 - Execution order is the topological order of edges (ties: node id). Layout
   never affects results.
+- `frames` (optional, omitted when empty): `{id: "f<k>", label, position, size}`
+  editor annotations drawn behind nodes. They never affect execution; the game
+  can ignore them.
 - Newer formats are rejected; older ones are migrated by `GraphDoc::from_json`.
 
 ## Node kinds
@@ -86,6 +89,7 @@ reading the same name.
 | `smooth` | `value` → `smoothed` (neighborhood) | `radius` 1–8 |
 | `solid` | `elevation` → `solid` (voxel) | |
 | `export_column` / `export_voxel` | `value` → (named export) | name = `label` |
+| `reroute_column` / `reroute_voxel` | `in` → `out` (same type) | wiring waypoint: no runtime work, no slot, no field |
 | `script` | declared in the Rhai header | (feature `scripting`) |
 
 At most one neighborhood node runs per graph (LayerGen has one cross-chunk

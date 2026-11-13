@@ -20,7 +20,7 @@ use crate::{
     ColumnData, FieldScope, Voxel,
 };
 
-static REGISTRY: [&NodeKind; 8] = [
+static REGISTRY: [&NodeKind; 10] = [
     &ELEVATION,
     &TEMPERATURE,
     &HUMIDITY,
@@ -29,6 +29,8 @@ static REGISTRY: [&NodeKind; 8] = [
     &SOLID,
     &EXPORT_COLUMN,
     &EXPORT_VOXEL,
+    &REROUTE_COLUMN,
+    &REROUTE_VOXEL,
 ];
 
 /// Every registered built-in node kind.
@@ -65,6 +67,8 @@ pub fn default_graph() -> GraphDoc {
 
     GraphDoc {
         format: crate::graph::FORMAT,
+        seed: crate::graph::DEFAULT_SEED,
+        frames: Vec::new(),
         nodes: vec![
             node("n1", "elevation", 0.0, 0.0),
             node("n2", "temperature", 320.0, -60.0),
@@ -504,4 +508,48 @@ pub static EXPORT_VOXEL: NodeKind = NodeKind {
     params: &[],
     world_reads: &[],
     build: Build::Export,
+};
+
+/// Wiring helper for column values: passes its input through unchanged. No
+/// runtime work and no slot of its own (the output aliases the input's slot).
+pub static REROUTE_COLUMN: NodeKind = NodeKind {
+    id: "reroute_column",
+    label: "Reroute (column)",
+    description: "Passes a column value through unchanged; a wire waypoint.",
+    inputs: &[input("in")],
+    outputs: &[FieldSpec {
+        name: Cow::Borrowed("out"),
+        scope: FieldScope::Column,
+        unit: Cow::Borrowed(""),
+        min: 0.0,
+        max: 1.0,
+        ramp: Cow::Borrowed("grayscale"),
+        display_from: None,
+    }],
+    params: &[],
+    world_reads: &[],
+    build: Build::Alias,
+};
+
+/// Wiring helper for voxel values; see `REROUTE_COLUMN`.
+pub static REROUTE_VOXEL: NodeKind = NodeKind {
+    id: "reroute_voxel",
+    label: "Reroute (voxel)",
+    description: "Passes a voxel value through unchanged; a wire waypoint.",
+    inputs: &[InputSpec {
+        name: Cow::Borrowed("in"),
+        scope: FieldScope::Voxel,
+    }],
+    outputs: &[FieldSpec {
+        name: Cow::Borrowed("out"),
+        scope: FieldScope::Voxel,
+        unit: Cow::Borrowed(""),
+        min: 0.0,
+        max: 1.0,
+        ramp: Cow::Borrowed("grayscale"),
+        display_from: None,
+    }],
+    params: &[],
+    world_reads: &[],
+    build: Build::Alias,
 };

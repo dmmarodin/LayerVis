@@ -5,6 +5,7 @@ import {
 	applyFieldView,
 	createFieldMaterial,
 	createFieldTextures,
+	finiteRange,
 	type ViewMode
 } from './fieldMaterial';
 
@@ -41,6 +42,8 @@ export class WorldOverlay {
 	private field: number | null = null;
 	private view: ViewMode | null = null;
 
+	/** Bumped by `invalidate`; samples requested before it are discarded. */
+	private epoch = 0;
 	private inFlight = false;
 	private pending: GridRequest | null = null;
 	private timer: ReturnType<typeof setTimeout> | null = null;
@@ -61,6 +64,23 @@ export class WorldOverlay {
 		this.field = field;
 		this.view = view;
 		this.refreshMaterial();
+	}
+
+	/** Drops the sampled grid (the world changed, e.g. a new seed) and resamples. */
+	public invalidate(): void {
+		this.epoch++;
+		this.pending = null;
+		this.grid = null;
+		this.textures.forEach((texture) => texture.dispose());
+		this.textures = [];
+		this.refreshMaterial();
+		this.emit();
+	}
+
+	/** Value range of a world field over the current grid (null if none). */
+	public fieldRange(field: number): [number, number] | null {
+		const plane = this.grid?.fields[field];
+		return plane ? finiteRange([plane]) : null;
 	}
 
 	/** Requests a new grid for the viewport unless the current one still covers it. */
@@ -111,6 +131,7 @@ export class WorldOverlay {
 		const request = this.pending;
 		this.pending = null;
 		this.inFlight = true;
+		const epoch = this.epoch;
 		this.emit();
 
 		try {
@@ -121,7 +142,7 @@ export class WorldOverlay {
 				request.width,
 				request.height
 			);
-			this.show(grid);
+			if (epoch === this.epoch) this.show(grid);
 			this.error = null;
 		} catch (error) {
 			console.error('World sampling failed', error);

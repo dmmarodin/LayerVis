@@ -191,6 +191,7 @@ impl ScriptDef {
                 // Script nodes are per-column only for now.
                 neighborhood: None,
                 export: false,
+                alias: false,
             },
         })
     }

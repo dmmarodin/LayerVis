@@ -36,7 +36,7 @@ use layergen::{
 };
 use serde::Serialize;
 
-pub use graph::{EdgeDoc, GraphDoc, NodeDoc, SocketRef};
+pub use graph::{EdgeDoc, FrameDoc, GraphDoc, NodeDoc, SocketRef, DEFAULT_SEED};
 pub use lru::{ByteLru, Weigh};
 pub use pipeline::{
     analyze, creates_cycle, resolve, Analysis, EdgeReport, Export, NodeReport, NodeStatus,

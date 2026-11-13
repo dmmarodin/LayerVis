@@ -132,6 +132,9 @@ pub enum Build {
     /// Named sink for game code: no runtime work, publishes its input's
     /// slot under the node's label (see `Analysis::exports`).
     Export,
+    /// Wiring helper (reroute): one input, one output of the same type, no
+    /// runtime work. The output aliases the input's slot and adds no field.
+    Alias,
 }
 
 /// A registered built-in node kind.
@@ -159,6 +162,8 @@ pub struct Contract {
     pub neighborhood: Option<Radius>,
     /// Export node: publishes its single input by name.
     pub export: bool,
+    /// Reroute: passes its single input through in the same slot.
+    pub alias: bool,
 }
 
 #[derive(Clone)]
@@ -205,6 +210,7 @@ pub fn resolve(node: &NodeDoc) -> ResolvedNode {
             world_reads: kind.world_reads.iter().map(|m| (*m).to_owned()).collect(),
             neighborhood,
             export: matches!(kind.build, Build::Export),
+            alias: matches!(kind.build, Build::Alias),
         })),
         implementation: Some(Implementation::Builtin(kind.build)),
         params,
@@ -512,6 +518,17 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
             export_names.insert(name, i);
         }
 
+        // Reroutes take no slot: their output is the input's slot.
+        if contract(i).is_some_and(|c| c.alias) {
+            let c = contract(i).expect("eligible nodes resolved");
+            let source = &incoming[&(i, c.inputs[0].name.to_string())];
+            let slot = slots[source];
+            slots.insert((i, c.outputs[0].name.to_string()), slot);
+            runnable[i] = true;
+            order.push(i);
+            continue;
+        }
+
         let outputs = &contract(i).expect("eligible nodes resolved").outputs;
         let columns = outputs.iter().filter(|o| o.scope == FieldScope::Column).count();
         let voxels = outputs.iter().filter(|o| o.scope == FieldScope::Voxel).count();
@@ -627,15 +644,28 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
 
     // 6. Schema (execution order) and bindings.
     let key = |node: usize, socket: &str| format!("{}.{socket}", doc.nodes[node].id);
+    // The real producer of a value: reroutes are looked through.
+    let origin = |mut source: (usize, String)| {
+        while let Some(c) = contract(source.0).filter(|c| c.alias) {
+            match incoming.get(&(source.0, c.inputs[0].name.to_string())) {
+                Some(next) => source = next.clone(),
+                None => break,
+            }
+        }
+        source
+    };
     let mut fields: Vec<FieldDef> = Vec::new();
 
     for &i in &order {
         let c = contract(i).expect("runnable");
+        if c.alias {
+            continue; // no slot, no field of its own
+        }
         for output in &c.outputs {
             // Re-processing outputs inherit display from their input's source.
             let source_field = output.display_from.as_ref().and_then(|input| {
-                let (source, socket) = incoming.get(&(i, input.to_string()))?;
-                fields.iter().find(|f| f.key == key(*source, socket)).cloned()
+                let (source, socket) = origin(incoming.get(&(i, input.to_string()))?.clone());
+                fields.iter().find(|f| f.key == key(source, &socket)).cloned()
             });
 
             fields.push(FieldDef {
@@ -739,13 +769,13 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
         .filter(|&&i| contract(i).is_some_and(|c| c.export))
         .filter_map(|&i| {
             let input = contract(i)?.inputs.first()?;
-            let (source, socket) = incoming.get(&(i, input.name.to_string()))?;
+            let (source, socket) = origin(incoming.get(&(i, input.name.to_string()))?.clone());
             Some(Export {
                 name: export_name(&doc.nodes[i]),
                 node: doc.nodes[i].id.clone(),
                 scope: input.scope,
-                slot: slots[&(*source, socket.clone())],
-                field: key(*source, socket),
+                slot: slots[&(source, socket.clone())],
+                field: key(source, &socket),
             })
         })
         .collect();
@@ -866,7 +896,7 @@ impl DynPipeline {
                 !resolved[analysis.order[position]]
                     .contract
                     .as_ref()
-                    .is_ok_and(|c| c.export)
+                    .is_ok_and(|c| c.export || c.alias)
             })
             .map(|position| {
                 let i = analysis.order[position];
@@ -908,7 +938,7 @@ impl DynPipeline {
             resolved[analysis.order[position]]
                 .contract
                 .as_ref()
-                .is_ok_and(|c| c.outputs.iter().all(|o| o.scope == FieldScope::Column))
+                .is_ok_and(|c| c.alias || c.outputs.iter().all(|o| o.scope == FieldScope::Column))
         })
     }
 }
@@ -1025,6 +1055,8 @@ pub(crate) mod tests {
     fn doc(nodes: Vec<NodeDoc>, edges: Vec<EdgeDoc>) -> GraphDoc {
         GraphDoc {
             format: 1,
+            seed: 1,
+            frames: Vec::new(),
             nodes,
             edges,
         }
@@ -1198,5 +1230,60 @@ pub(crate) mod tests {
         assert!(report(&analysis, "n2").export);
         // Exports add no slots of their own.
         assert_eq!(analysis.schema.fields.len(), 1);
+    }
+
+    #[test]
+    fn reroutes_alias_slots_chain_and_are_looked_through() {
+        let mut height = node("n5", "export_column");
+        height.label = Some("height".into());
+
+        // elevation → reroute → reroute → temperature / export; solid via a voxel reroute.
+        let graph = doc(
+            vec![
+                node("n1", "elevation"),
+                node("n2", "reroute_column"),
+                node("n3", "reroute_column"),
+                node("n4", "temperature"),
+                height,
+                node("n6", "solid"),
+                node("n7", "reroute_voxel"),
+                node("n8", "export_voxel"),
+            ],
+            vec![
+                edge("n1", "elevation", "n2", "in"),
+                edge("n2", "out", "n3", "in"),
+                edge("n3", "out", "n4", "elevation"),
+                edge("n3", "out", "n5", "value"),
+                edge("n1", "elevation", "n6", "elevation"),
+                edge("n6", "solid", "n7", "in"),
+                edge("n7", "out", "n8", "value"),
+            ],
+        );
+        let analysis = run(&graph);
+        let elevation = analysis.schema.slot("n1.elevation").unwrap();
+
+        // Reroutes run, take no slots and add no fields.
+        assert!(["n2", "n3", "n7"]
+            .iter()
+            .all(|id| report(&analysis, id).status == NodeStatus::Active));
+        let keys: Vec<_> = analysis.schema.fields.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(keys, ["n1.elevation", "n4.temperature", "n6.solid"]);
+
+        // Consumers read the original slot; exports report the real producer.
+        assert_eq!(
+            analysis.bindings[3].as_ref().unwrap().input("elevation"),
+            Ok(elevation)
+        );
+        assert_eq!(analysis.exports[0].slot, elevation);
+        assert_eq!(analysis.exports[0].field, "n1.elevation");
+        assert_eq!(analysis.exports[1].field, "n6.solid");
+        assert_eq!(analysis.exports[1].slot, analysis.schema.slot("n6.solid").unwrap());
+
+        // A reroute only passes the same type through.
+        let mismatched = doc(
+            vec![node("n1", "solid"), node("n2", "reroute_column")],
+            vec![edge("n1", "solid", "n2", "in")],
+        );
+        assert!(!run(&mismatched).edges[0].valid);
     }
 }

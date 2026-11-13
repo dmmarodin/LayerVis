@@ -10,12 +10,39 @@ use serde::{Deserialize, Serialize};
 
 pub const FORMAT: u32 = 1;
 
+/// Seed of documents that do not store one (and of new projects).
+pub const DEFAULT_SEED: u64 = 12345;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GraphDoc {
     pub format: u32,
+    /// World seed. Part of the world definition: the same graph with the same
+    /// seed generates the same world. Optional in files (older files and
+    /// hand-written ones get `DEFAULT_SEED`), so still `format: 1`.
+    #[serde(default = "default_seed")]
+    pub seed: u64,
     pub nodes: Vec<NodeDoc>,
     pub edges: Vec<EdgeDoc>,
+    /// Editor annotations (labelled boxes around nodes). Layout only: they
+    /// never affect execution, and the game can ignore them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frames: Vec<FrameDoc>,
+}
+
+/// A labelled rectangle drawn behind nodes to group them visually.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameDoc {
+    /// Unique, stable (`f<k>`); never collides with node ids (`n<k>`).
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    /// Top-left corner, in graph units.
+    #[serde(default)]
+    pub position: (f64, f64),
+    /// Width and height, in graph units.
+    pub size: (f64, f64),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -44,6 +71,10 @@ pub struct NodeDoc {
 
 fn enabled_default() -> bool {
     true
+}
+
+fn default_seed() -> u64 {
+    DEFAULT_SEED
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -81,6 +112,13 @@ impl GraphDoc {
             }
         }
 
+        let mut frame_ids = std::collections::HashSet::new();
+        for frame in &doc.frames {
+            if !frame_ids.insert(frame.id.as_str()) || ids.contains(frame.id.as_str()) {
+                return Err(format!("duplicate id `{}`", frame.id));
+            }
+        }
+
         Ok(doc)
     }
 
@@ -94,6 +132,21 @@ impl GraphDoc {
 
     pub fn node_mut(&mut self, id: &str) -> Option<&mut NodeDoc> {
         self.nodes.iter_mut().find(|node| node.id == id)
+    }
+
+    pub fn frame_mut(&mut self, id: &str) -> Option<&mut FrameDoc> {
+        self.frames.iter_mut().find(|frame| frame.id == id)
+    }
+
+    /// Next free `f<k>` frame id.
+    pub fn next_frame_id(&self) -> String {
+        let next = self
+            .frames
+            .iter()
+            .filter_map(|frame| frame.id.strip_prefix('f')?.parse::<u64>().ok())
+            .max()
+            .map_or(1, |max| max + 1);
+        format!("f{next}")
     }
 
     /// Next free `n<k>` id.
@@ -132,6 +185,15 @@ mod tests {
 
         assert!(doc.nodes[0].enabled);
         assert_eq!(doc.nodes[0].position, (0.0, 0.0));
+        assert_eq!(doc.seed, DEFAULT_SEED);
+        assert!(doc.frames.is_empty());
+        assert!(!doc.to_json().contains("frames"), "empty frames are not written");
+
+        let seeded = GraphDoc {
+            seed: u64::MAX,
+            ..doc.clone()
+        };
+        assert_eq!(GraphDoc::from_json(&seeded.to_json()).unwrap().seed, u64::MAX);
         assert_eq!(GraphDoc::from_json(&doc.to_json()).unwrap(), doc);
         assert_eq!(doc.next_id(), "n2");
     }
@@ -145,5 +207,19 @@ mod tests {
         let duplicate = r#"{"format": 1, "edges": [], "nodes": [
             {"id": "n1", "kind": "a"}, {"id": "n1", "kind": "b"}]}"#;
         assert!(GraphDoc::from_json(duplicate).unwrap_err().contains("duplicate"));
+    }
+
+    #[test]
+    fn frames_round_trip_and_ids_must_be_unique() {
+        let text = r#"{"format": 1, "nodes": [{"id": "n1", "kind": "elevation"}], "edges": [],
+            "frames": [{"id": "f2", "label": "Climate", "position": [10, 20], "size": [300, 200]}]}"#;
+        let doc = GraphDoc::from_json(text).unwrap();
+
+        assert_eq!(doc.frames[0].size, (300.0, 200.0));
+        assert_eq!(doc.next_frame_id(), "f3");
+        assert_eq!(GraphDoc::from_json(&doc.to_json()).unwrap(), doc);
+
+        let clash = text.replace("\"f2\"", "\"n1\"");
+        assert!(GraphDoc::from_json(&clash).unwrap_err().contains("duplicate"));
     }
 }

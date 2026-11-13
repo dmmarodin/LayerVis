@@ -2,7 +2,7 @@ import type * as THREE from 'three';
 import { generateChunk, type WorldInfo } from '../bridge';
 import type { ViewBounds } from './camera';
 import { ChunkTile, type RenderView } from './tiles';
-import { sampleGrid } from './fieldMaterial';
+import { finiteRange, sampleGrid } from './fieldMaterial';
 
 /** Above this many visible chunks, stop requesting (zoomed-out views come later). */
 export const MAX_VISIBLE_CHUNKS = 1024;
@@ -78,6 +78,21 @@ export class ChunkStreamer {
 		const grid = resident.tile.columns;
 		const values = grid.fields.map((_, field) => sampleGrid(grid, field, x, y));
 		return values.some((value) => value === null) ? null : (values as number[]);
+	}
+
+	/** Value range of a column field over the loaded chunks in view (null if none). */
+	public visibleRange(bounds: ViewBounds, field: number): [number, number] | null {
+		const range = this.chunkRange(bounds, 0);
+		const planes: Float32Array[] = [];
+
+		for (let y = range.y0; y <= range.y1; y++) {
+			for (let x = range.x0; x <= range.x1; x++) {
+				const plane = this.resident.get(key(x, y))?.tile.columns.fields[field];
+				if (plane) planes.push(plane);
+			}
+		}
+
+		return finiteRange(planes);
 	}
 
 	public update(bounds: ViewBounds): void {

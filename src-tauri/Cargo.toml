@@ -27,6 +27,7 @@ layergen = { package = "layergen-rs", path = "../../LayerGen" }
 rayon = "1"
 # Graph format, node kinds, world models and pipeline building (shared with the game).
 worldgraph = { path = "../crates/worldgraph" }
+tauri-plugin-dialog = "2"
 
 # Generation code is hot even while developing; unoptimized builds make
 # world sampling and chunk generation visibly slow in `tauri dev`.

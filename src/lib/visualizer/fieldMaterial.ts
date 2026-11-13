@@ -88,6 +88,69 @@ const fragmentShader = /* glsl */ `
 	}
 `;
 
+type Stop = [position: number, r: number, g: number, b: number];
+
+/**
+ * Color stops mirroring the shader ramps, for the sidebar legend only.
+ * Keep in sync with the GLSL above (repeated positions are hard edges).
+ */
+const RAMP_STOPS: Record<Exclude<Ramp, 'categorical'>, Stop[]> = {
+	grayscale: [
+		[0, 0, 0, 0],
+		[1, 1, 1, 1]
+	],
+	terrain: [
+		[0, 0.05, 0.12, 0.35],
+		[0.3, 0.15, 0.4, 0.7],
+		[0.3, 0.8, 0.75, 0.5],
+		[0.34, 0.35, 0.6, 0.25],
+		[0.65, 0.2, 0.4, 0.15],
+		[0.65, 0.45, 0.38, 0.3],
+		[0.85, 0.55, 0.52, 0.5],
+		[0.85, 0.85, 0.85, 0.9],
+		[1, 1, 1, 1]
+	],
+	thermal: [
+		[0, 0.1, 0.15, 0.6],
+		[0.33, 0.2, 0.7, 0.9],
+		[0.66, 0.95, 0.9, 0.3],
+		[1, 0.85, 0.15, 0.1]
+	],
+	diverging: [
+		[0, 0.15, 0.3, 0.75],
+		[0.5, 0.95, 0.95, 0.95],
+		[1, 0.8, 0.15, 0.15]
+	]
+};
+
+/** CSS gradient of a ramp (left = min, right = max); null for categorical. */
+export function rampGradient(ramp: Ramp): string | null {
+	if (ramp === 'categorical') return null;
+
+	const channel = (value: number) => Math.round(value * 255);
+	const stops = RAMP_STOPS[ramp].map(
+		([at, r, g, b]) => `rgb(${channel(r)} ${channel(g)} ${channel(b)}) ${at * 100}%`
+	);
+	return `linear-gradient(to right, ${stops.join(', ')})`;
+}
+
+/** Min and max of the finite values in `planes`, or null when there are none. */
+export function finiteRange(planes: Iterable<ArrayLike<number>>): [number, number] | null {
+	let lo = Infinity;
+	let hi = -Infinity;
+
+	for (const plane of planes) {
+		for (let i = 0; i < plane.length; i++) {
+			const value = plane[i];
+			if (value < lo) lo = value;
+			if (value > hi) hi = value;
+		}
+	}
+
+	// NaN (outside the world) never compares, so it is skipped.
+	return lo <= hi ? [lo, hi] : null;
+}
+
 export function createFieldMaterial(): THREE.ShaderMaterial {
 	return new THREE.ShaderMaterial({
 		vertexShader,

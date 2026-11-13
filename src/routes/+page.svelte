@@ -3,6 +3,7 @@
 	import Sidebar from '$lib/components/Sidebar.svelte';
 	import PipelineGraph from '$lib/components/graph/PipelineGraph.svelte';
 	import ScriptEditor from '$lib/components/ScriptEditor.svelte';
+	import MenuBar from '$lib/components/MenuBar.svelte';
 	import { Visualizer, type HoverInfo, type VisualizerCallbacks } from '$lib/visualizer/visualizer';
 	import type { ViewMode } from '$lib/visualizer/fieldMaterial';
 	import { MAX_VISIBLE_CHUNKS, type StreamStats } from '$lib/visualizer/streaming';
@@ -10,11 +11,23 @@
 	import {
 		addNode,
 		connect,
-		disconnect,
+		addFrame,
+		disconnectMany,
+		exportCopy,
+		insertReroute,
 		graphFile,
 		moveNodes,
+		newProject,
+		openProject,
 		pipelineGraph,
-		removeNode,
+		projectState,
+		redo,
+		removeItems,
+		saveProject,
+		saveProjectAs,
+		setSeed,
+		undo,
+		updateFrame,
 		scriptSource,
 		scriptTemplate,
 		setNodeEnabled,
@@ -23,6 +36,7 @@
 		updateScript,
 		worldInfo,
 		type PipelineGraph as Graph,
+		type ProjectState,
 		type SocketRef,
 		type WorldInfo
 	} from '$lib/bridge';
@@ -32,6 +46,7 @@
 	let world: WorldInfo | null = null;
 	let graph: Graph | null = null;
 	let savedTo: string | null = null;
+	let project: ProjectState | null = null;
 	let graphBusy = false;
 	let graphError: string | null = null;
 	let showGraph = true;
@@ -83,7 +98,12 @@
 		window.addEventListener('resize', onResize);
 
 		try {
-			[world, graph, savedTo] = await Promise.all([worldInfo(), pipelineGraph(), graphFile()]);
+			[world, graph, savedTo, project] = await Promise.all([
+				worldInfo(),
+				pipelineGraph(),
+				graphFile(),
+				projectState()
+			]);
 			visualizer.start(world, callbacks);
 		} catch (error) {
 			chunkStatus = `Backend unavailable: ${error}`;
@@ -117,28 +137,131 @@
 		}
 		world = await worldInfo();
 		visualizer?.start(world, callbacks);
+		await refreshProject();
 	}
 
-	/** Runs several edits in sequence as one user action. */
-	async function sequence<T>(items: T[], edit: (item: T) => Promise<Graph>): Promise<Graph> {
-		let last: Graph | null = null;
-		for (const item of items) last = await edit(item);
-		return last ?? (await pipelineGraph());
+	/** Re-reads dirty / undo state (also updates the window title). */
+	async function refreshProject() {
+		project = await projectState().catch(() => project);
+	}
+
+	/**
+	 * New / Open: swaps the whole graph, so selection and the script editor reset.
+	 * A cancelled dialog (null) changes nothing.
+	 */
+	async function replaceProject(run: () => Promise<ProjectState | null>) {
+		if (graphBusy) return;
+		graphBusy = true;
+		graphError = null;
+
+		try {
+			const next = await run();
+			if (next) {
+				selectedStep = null;
+				editor = null;
+				await applyEdit(pipelineGraph);
+			}
+		} catch (error) {
+			graphError = String(error);
+			await refreshProject();
+		} finally {
+			graphBusy = false;
+		}
+	}
+
+	/** Save / Save as / Export: the graph itself is unchanged. */
+	async function writeProject(run: () => Promise<ProjectState | null>) {
+		if (graphBusy) return;
+		graphBusy = true;
+		graphError = null;
+
+		try {
+			project = (await run()) ?? project;
+		} catch (error) {
+			graphError = String(error);
+		} finally {
+			graphBusy = false;
+		}
+	}
+
+	const menuActions = {
+		onNew: () => replaceProject(newProject),
+		onOpen: () => replaceProject(() => openProject()),
+		onOpenRecent: (path: string) => replaceProject(() => openProject(path)),
+		onSave: () => writeProject(saveProject),
+		onSaveAs: () => writeProject(saveProjectAs),
+		onExport: () => writeProject(exportCopy),
+		onUndo: () => {
+			if (project?.canUndo) editGraph(undo);
+		},
+		onRedo: () => {
+			if (project?.canRedo) editGraph(redo);
+		},
+		onToggleGraph: () => (showGraph = !showGraph)
+	};
+
+	function onKeyDown(event: KeyboardEvent) {
+		if (editor || !(event.ctrlKey || event.metaKey) || event.altKey) return;
+
+		// Text fields keep their own undo.
+		const target = event.target as HTMLElement | null;
+		const typing = target?.closest('input, textarea, select, [contenteditable]') != null;
+		const key = event.key.toLowerCase();
+
+		if (key === 'n') menuActions.onNew();
+		else if (key === 'o') menuActions.onOpen();
+		else if (key === 's') (event.shiftKey ? menuActions.onSaveAs : menuActions.onSave)();
+		else if (typing) return;
+		else if (key === 'z') (event.shiftKey ? menuActions.onRedo : menuActions.onUndo)();
+		else if (key === 'y') menuActions.onRedo();
+		else return;
+
+		event.preventDefault();
+	}
+
+	/**
+	 * Layout-only edits (frames): update the graph and dirty state without
+	 * reloading the world or restarting chunk streaming.
+	 */
+	async function editLayout(edit: () => Promise<Graph>) {
+		graphError = null;
+		try {
+			graph = await edit();
+			await refreshProject();
+		} catch (error) {
+			graphError = String(error);
+			graph = await pipelineGraph().catch(() => graph);
+		}
 	}
 
 	const graphActions = {
 		onToggle: (id: string, enabled: boolean) => editGraph(() => setNodeEnabled(id, enabled)),
-		onRemove: (ids: string[]) => editGraph(() => sequence(ids, removeNode)),
+		// One undo step per delete; frames-only deletes never touch generation.
+		onRemove: (ids: string[]) =>
+			ids.every((id) => id.startsWith('f'))
+				? editLayout(() => removeItems(ids))
+				: editGraph(() => removeItems(ids)),
+		onInsertReroute: (from: SocketRef, to: SocketRef, x: number, y: number) =>
+			editGraph(async () => (await insertReroute(from, to, x, y)).graph),
+		onAddFrame: (x: number, y: number, width: number, height: number) =>
+			editLayout(async () => (await addFrame(x, y, width, height)).graph),
+		onFrameLabel: (id: string, label: string) => editLayout(() => updateFrame(id, { label })),
+		onFrameResize: (id: string, x: number, y: number, width: number, height: number) =>
+			editLayout(() => updateFrame(id, { x, y, width, height })),
 		onAdd: (kind: string, x: number, y: number) =>
 			editGraph(async () => (await addNode(kind, x, y)).graph),
 		onConnect: (from: SocketRef, to: SocketRef) => editGraph(() => connect(from, to)),
-		onDisconnect: (inputs: SocketRef[]) => editGraph(() => sequence(inputs, disconnect)),
+		onDisconnect: (inputs: SocketRef[]) => editGraph(() => disconnectMany(inputs)),
 		onParam: (id: string, name: string, value: number) =>
 			editGraph(() => setParam(id, name, value)),
 		onLabel: (id: string, label: string) => editGraph(() => setLabel(id, label)),
 		// Layout only: no new revision, no chunk reload.
 		onMove: (moves: Array<{ id: string; x: number; y: number }>) => {
-			if (moves.length) moveNodes(moves).catch((error) => (graphError = String(error)));
+			if (moves.length) {
+				moveNodes(moves)
+					.then(refreshProject)
+					.catch((error) => (graphError = String(error)));
+			}
 		}
 	};
 
@@ -199,8 +322,76 @@
 		requestAnimationFrame(() => visualizer?.resize());
 	}
 
-	$: showGraph, onCanvasResize();
+	$: showGraph, graphHeight, onCanvasResize();
+
+	// --- Resizable graph panel ----------------------------------------------
+
+	const DEFAULT_GRAPH_HEIGHT = 320;
+	const MIN_GRAPH_HEIGHT = 120;
+	/** Always leave this much room for the map. */
+	const MIN_MAP_HEIGHT = 160;
+
+	let graphHeight = DEFAULT_GRAPH_HEIGHT;
+	let mainElement: HTMLDivElement | null = null;
+	let resizing = false;
+
+	try {
+		const saved = Number(localStorage.getItem('layervis.graphHeight'));
+		if (Number.isFinite(saved) && saved >= MIN_GRAPH_HEIGHT) graphHeight = saved;
+	} catch {
+		// Storage unavailable: use the default.
+	}
+
+	const clampGraphHeight = (value: number) => {
+		const max = (mainElement?.clientHeight ?? 1000) - MIN_MAP_HEIGHT;
+		return Math.round(Math.max(MIN_GRAPH_HEIGHT, Math.min(max, value)));
+	};
+
+	function saveGraphHeight() {
+		try {
+			localStorage.setItem('layervis.graphHeight', String(graphHeight));
+		} catch {
+			// Not persisting is fine.
+		}
+	}
+
+	function startResize(event: PointerEvent) {
+		resizing = true;
+		(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+		event.preventDefault();
+	}
+
+	function onResizeMove(event: PointerEvent) {
+		if (!resizing || !mainElement) return;
+		// The panel is anchored to the bottom of the main column.
+		graphHeight = clampGraphHeight(mainElement.getBoundingClientRect().bottom - event.clientY);
+	}
+
+	function endResize() {
+		if (!resizing) return;
+		resizing = false;
+		saveGraphHeight();
+	}
+
+	/** Double-click the bar: toggle between the default and a tall panel. */
+	function toggleTall() {
+		const tall = clampGraphHeight((mainElement?.clientHeight ?? 800) * 0.7);
+		graphHeight = graphHeight >= tall - 4 ? DEFAULT_GRAPH_HEIGHT : tall;
+		saveGraphHeight();
+	}
 </script>
+
+<svelte:window on:keydown={onKeyDown} />
+
+<div class="shell">
+<MenuBar
+	{project}
+	{showGraph}
+	busy={graphBusy}
+	error={showGraph ? null : graphError}
+	onDismissError={() => (graphError = null)}
+	{...menuActions}
+/>
 
 <div class="app-container">
 	<Sidebar
@@ -210,9 +401,13 @@
 		{stageFields}
 		statusLines={[chunkStatus, worldStatus].filter(Boolean)}
 		{onViewChange}
+		busy={graphBusy}
+		onSeed={(seed) => editGraph(() => setSeed(seed))}
+		onGoTo={(x, y) => visualizer?.goTo(x, y)}
+		getDataRange={() => visualizer?.dataRange() ?? null}
 	/>
 
-	<div class="main">
+	<div class="main" bind:this={mainElement}>
 		<div bind:this={canvasContainer} class="canvas-container">
 			<button class="graph-toggle" on:click={() => (showGraph = !showGraph)}>
 				{showGraph ? 'Hide graph' : 'Show graph'}
@@ -228,7 +423,20 @@
 		</div>
 
 		{#if showGraph}
-			<div class="graph-container">
+			<div
+				class="splitter"
+				class:active={resizing}
+				role="separator"
+				aria-orientation="horizontal"
+				aria-label="Resize node graph (double-click to toggle tall)"
+				title="Drag to resize · double-click to toggle tall"
+				on:pointerdown={startResize}
+				on:pointermove={onResizeMove}
+				on:pointerup={endResize}
+				on:pointercancel={endResize}
+				on:dblclick={toggleTall}
+			></div>
+			<div class="graph-container" style:height="{graphHeight}px">
 				<PipelineGraph
 					{graph}
 					busy={graphBusy}
@@ -243,6 +451,7 @@
 			</div>
 		{/if}
 	</div>
+</div>
 </div>
 
 {#if editor}
@@ -259,9 +468,16 @@
 {/if}
 
 <style>
+	.shell {
+		display: flex;
+		flex-direction: column;
+		height: 100%;
+	}
+
 	.app-container {
 		display: flex;
-		height: 100%;
+		flex: 1;
+		min-height: 0;
 	}
 
 	.main {
@@ -318,7 +534,20 @@
 	}
 
 	.graph-container {
-		height: 320px;
 		flex-shrink: 0;
+		min-height: 0;
+	}
+
+	.splitter {
+		height: 6px;
+		flex-shrink: 0;
+		cursor: row-resize;
+		background: #2d303d;
+		touch-action: none;
+	}
+
+	.splitter:hover,
+	.splitter.active {
+		background: #6fa8ff;
 	}
 </style>

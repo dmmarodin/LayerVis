@@ -61,6 +61,8 @@ export class Visualizer {
 		const scene = Context.getInstance().scene;
 
 		this.streamer?.dispose();
+		// A new seed changes the world models too, not just the pipeline.
+		if (this.world && this.world.seed !== world.seed) this.overlay?.invalidate();
 		this.world = world;
 		this.callbacks = callbacks;
 		this.streamer = new ChunkStreamer(world, scene, () => this.view, callbacks.onStream);
@@ -86,6 +88,23 @@ export class Visualizer {
 	public setStage(fields: string[] | null): void {
 		this.stageFields = fields ? new Set(fields) : null;
 		this.refreshView();
+	}
+
+	/** Centers the camera on a world column (zoom is kept). */
+	public goTo(x: number, y: number): void {
+		const camera = Context.getInstance().camera;
+		camera.position.set(x, y, camera.position.z);
+		camera.notifyChange();
+	}
+
+	/** Value range of the selected field in what is currently loaded and in view. */
+	public dataRange(): [number, number] | null {
+		const bounds = Context.getInstance().camera.viewBounds();
+		const { source, field } = this.view;
+
+		return source === 'column'
+			? (this.streamer?.visibleRange(bounds, field) ?? null)
+			: (this.overlay?.fieldRange(field) ?? null);
 	}
 
 	private refreshView(): void {

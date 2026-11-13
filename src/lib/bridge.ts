@@ -22,7 +22,8 @@ export interface WorldInfo {
 	origin: [number, number, number];
 	dimensions: [number, number, number];
 	chunkSize: [number, number, number];
-	seed: number;
+	/** Decimal string (u64). */
+	seed: string;
 	/** Pipeline revision of this schema; chunk payloads carry it too. */
 	revision: number;
 	/** Order matches the field planes in chunk payloads. */
@@ -113,9 +114,19 @@ export interface Export {
 	field: string;
 }
 
+/** Labelled box drawn behind nodes (layout only; never affects generation). */
+export interface Frame {
+	id: string;
+	label: string;
+	/** Top-left corner in graph units. */
+	position: [number, number];
+	size: [number, number];
+}
+
 export interface PipelineGraph {
 	revision: number;
 	nodes: NodeReport[];
+	frames: Frame[];
 	exports: Export[];
 	edges: EdgeReport[];
 	/** Display-only: world model → node that queries it. */
@@ -131,6 +142,29 @@ export const pipelineGraph = () => invoke<PipelineGraph>('pipeline_graph');
 export const addNode = (kind: string, x: number, y: number, source: string | null = null) =>
 	invoke<{ id: string; graph: PipelineGraph }>('add_node', { kind, x, y, source });
 export const removeNode = (id: string) => invoke<PipelineGraph>('remove_node', { id });
+/** Deletes nodes and/or frames as one undo step. */
+export const removeItems = (ids: string[]) => invoke<PipelineGraph>('remove_items', { ids });
+/** Cuts several inputs' wires as one undo step. */
+export const disconnectMany = (inputs: SocketRef[]) =>
+	invoke<PipelineGraph>('disconnect_many', { inputs });
+/** Splits a wire with a reroute node. */
+export const insertReroute = (from: SocketRef, to: SocketRef, x: number, y: number) =>
+	invoke<{ id: string; graph: PipelineGraph }>('insert_reroute', { from, to, x, y });
+export const addFrame = (x: number, y: number, width: number, height: number) =>
+	invoke<{ id: string; graph: PipelineGraph }>('add_frame', { x, y, width, height });
+/** Frame label, position and/or size as one undo step (position/size need both parts). */
+export const updateFrame = (
+	id: string,
+	changes: { label?: string; x?: number; y?: number; width?: number; height?: number }
+) =>
+	invoke<PipelineGraph>('update_frame', {
+		id,
+		label: changes.label ?? null,
+		x: changes.x ?? null,
+		y: changes.y ?? null,
+		width: changes.width ?? null,
+		height: changes.height ?? null
+	});
 export const setNodeEnabled = (id: string, enabled: boolean) =>
 	invoke<PipelineGraph>('set_node_enabled', { id, enabled });
 /** Node title; for Export nodes the export name game code reads. Empty clears. */
@@ -146,6 +180,29 @@ export const moveNodes = (moves: Array<{ id: string; x: number; y: number }>) =>
 	invoke<void>('move_nodes', { moves });
 /** Path of the autosaved graph document. */
 export const graphFile = () => invoke<string>('graph_file');
+
+export interface ProjectState {
+	/** Project file, or null for a graph never saved to a file. */
+	path: string | null;
+	name: string;
+	/** Differs from what was last saved/opened. */
+	dirty: boolean;
+	recent: string[];
+	canUndo: boolean;
+	canRedo: boolean;
+}
+export const projectState = () => invoke<ProjectState>('project_state');
+/** Project file commands resolve to null when the user cancels a dialog. */
+export const newProject = () => invoke<ProjectState | null>('new_project');
+export const openProject = (path: string | null = null) =>
+	invoke<ProjectState | null>('open_project', { path });
+export const saveProject = () => invoke<ProjectState | null>('save_project');
+export const saveProjectAs = () => invoke<ProjectState | null>('save_project_as');
+export const exportCopy = () => invoke<ProjectState | null>('export_copy');
+/** Seeds are decimal strings: u64 does not fit a JS number exactly. */
+export const setSeed = (seed: string) => invoke<PipelineGraph>('set_seed', { seed });
+export const undo = () => invoke<PipelineGraph>('undo');
+export const redo = () => invoke<PipelineGraph>('redo');
 
 /** Replaces a script node's source; rejects with the error text. */
 export const updateScript = (id: string, source: string) =>

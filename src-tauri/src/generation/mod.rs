@@ -16,7 +16,7 @@ use layergen::{ChunkCoord, ChunkSize, PipelineConfig, WorldBounds};
 use serde::Serialize;
 use worldgraph::{
     creates_cycle, graph::id_order, pipeline::SCRIPT_KIND, resolve, steps, ColumnData, EdgeDoc,
-    Export, FieldDef, FieldScope, GraphDoc, GraphPipeline, NodeDoc, NodeReport, NodeStatus,
+    Export, FieldDef, FieldScope, FrameDoc, GraphDoc, GraphPipeline, NodeDoc, NodeReport, NodeStatus,
     SocketRef, Voxel,
 };
 
@@ -33,12 +33,18 @@ const MAX_WORLD_SAMPLES: u64 = 1024 * 1024;
 /// Column payloads are a few KB per 32×32 chunk; this holds thousands.
 const PAYLOAD_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
+fn seed_as_string<S: serde::Serializer>(seed: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(seed)
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorldInfo {
     pub origin: (i64, i64, i64),
     pub dimensions: (u32, u32, u32),
     pub chunk_size: (u32, u32, u32),
+    /// A string: u64 seeds exceed what JS numbers represent exactly.
+    #[serde(serialize_with = "seed_as_string")]
     pub seed: u64,
     /// Pipeline revision this schema belongs to (also tagged in payloads).
     pub revision: u64,
@@ -76,6 +82,8 @@ pub struct PipelineGraph {
     pub edges: Vec<EdgeReport>,
     pub world_edges: Vec<WorldEdge>,
     pub exports: Vec<Export>,
+    /// Editor annotations (layout only).
+    pub frames: Vec<FrameDoc>,
     /// Built-in kinds that can be added.
     pub kinds: Vec<KindInfo>,
     pub world_models: Vec<&'static str>,
@@ -93,49 +101,115 @@ pub struct CacheStats {
 /// One immutable published revision.
 struct Active {
     revision: u64,
+    /// Config and world models belong to the doc's seed: changing the seed
+    /// publishes a revision with a new world stage.
+    config: PipelineConfig,
+    world: Arc<WorldStore>,
     pipeline: GraphPipeline,
 }
 
-/// Mutable session state: the doc (incl. layout) and the published revision.
+/// A doc built into a pipeline, with the world stage for its seed.
+struct Built {
+    config: PipelineConfig,
+    world: Arc<WorldStore>,
+    pipeline: GraphPipeline,
+}
+
+fn config_for(seed: u64) -> Result<PipelineConfig, String> {
+    Ok(PipelineConfig::new(
+        WorldBounds::new((-4096, -4096, 0), (8192, 8192, 128))?,
+        ChunkSize::new(32, 32, 32)?,
+        seed,
+    ))
+}
+
+/// Builds `doc`, reusing the world stage of `previous` when the seed is the
+/// same (the world stage is built once per seed and serves every revision).
+fn build(doc: &GraphDoc, previous: Option<&Active>) -> Result<Built, String> {
+    let (config, world) = match previous.filter(|active| active.config.seed() == doc.seed) {
+        Some(active) => (active.config, Arc::clone(&active.world)),
+        None => {
+            let config = config_for(doc.seed)?;
+            (config, Arc::new(WorldStore::new(&config)))
+        }
+    };
+    let pipeline = GraphPipeline::build(doc, config, &world)?;
+
+    Ok(Built {
+        config,
+        world,
+        pipeline,
+    })
+}
+
+/// Undo steps kept per session.
+const HISTORY_LIMIT: usize = 200;
+
+/// Mutable session state: the doc (incl. layout), the published revision and
+/// the undo/redo history (doc snapshots).
 struct State {
     doc: GraphDoc,
     active: Arc<Active>,
+    undo: Vec<GraphDoc>,
+    redo: Vec<GraphDoc>,
+}
+
+impl State {
+    /// Remembers `previous` as an undo step (a new edit invalidates redo).
+    fn record(&mut self, previous: GraphDoc) {
+        if previous == self.doc {
+            return;
+        }
+        self.undo.push(previous);
+        if self.undo.len() > HISTORY_LIMIT {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    /// Publishes `doc` as the next revision.
+    fn publish(&mut self, doc: GraphDoc, built: Built) {
+        self.doc = doc;
+        self.active = Arc::new(Active {
+            revision: self.active.revision + 1,
+            config: built.config,
+            world: built.world,
+            pipeline: built.pipeline,
+        });
+    }
 }
 
 pub struct Session {
-    config: PipelineConfig,
-    world: Arc<WorldStore>,
     state: RwLock<State>,
     cache: Mutex<PayloadCache>,
 }
 
 impl Session {
+    /// The default graph with the given seed.
     pub fn new(seed: u64) -> Result<Self, String> {
-        Self::with_doc(seed, steps::default_graph())
+        Self::with_doc(GraphDoc {
+            seed,
+            ..steps::default_graph()
+        })
     }
 
-    /// Loads a saved graph. Not validated by generation (a script that fails
-    /// at runtime should still open, so it can be fixed in the editor).
-    pub fn with_doc(seed: u64, doc: GraphDoc) -> Result<Self, String> {
-        let config = PipelineConfig::new(
-            WorldBounds::new((-4096, -4096, 0), (8192, 8192, 128))?,
-            ChunkSize::new(32, 32, 32)?,
-            seed,
-        );
-
-        // World stage runs once per session (seed) and serves every revision.
-        let world = Arc::new(WorldStore::new(&config));
-        let pipeline = GraphPipeline::build(&doc, config, &world)?;
+    /// Loads a saved graph (and its seed). Not validated by generation (a
+    /// script that fails at runtime should still open, so it can be fixed in
+    /// the editor).
+    pub fn with_doc(doc: GraphDoc) -> Result<Self, String> {
+        let built = build(&doc, None)?;
 
         Ok(Self {
-            config,
-            world,
             state: RwLock::new(State {
                 doc,
                 active: Arc::new(Active {
                     revision: 0,
-                    pipeline,
+                    config: built.config,
+                    world: built.world,
+                    pipeline: built.pipeline,
                 }),
+                undo: Vec::new(),
+                redo: Vec::new(),
             }),
             cache: Mutex::new(PayloadCache::new(PAYLOAD_CACHE_BYTES)),
         })
@@ -170,7 +244,7 @@ impl Session {
             return Ok(bytes);
         }
 
-        let chunk = active.pipeline.generate(coord, &self.world)?;
+        let chunk = active.pipeline.generate(coord, &active.world)?;
         let bytes = Arc::new(encode_columns(
             &chunk,
             &active.pipeline.schema().column_fields(),
@@ -199,20 +273,20 @@ impl Session {
     }
 
     pub fn world_info(&self) -> WorldInfo {
-        let world = self.config.world();
         let active = self.active();
+        let bounds = active.config.world();
 
         WorldInfo {
-            origin: world.origin(),
-            dimensions: world.dimensions(),
-            chunk_size: self.config.chunk_size().dimensions(),
-            seed: self.config.seed(),
+            origin: bounds.origin(),
+            dimensions: bounds.dimensions(),
+            chunk_size: active.config.chunk_size().dimensions(),
+            seed: active.config.seed(),
             revision: active.revision,
             column_fields: active.pipeline.schema().column_fields(),
             voxel_fields: active.pipeline.schema().voxel_fields(),
             world_fields: worldgraph::world_fields(),
             exports: active.pipeline.exports().to_vec(),
-            plate_count: self.world.tectonics.plates().len(),
+            plate_count: active.world.tectonics.plates().len(),
         }
     }
 
@@ -255,6 +329,7 @@ impl Session {
             edges: analysis.edges.clone(),
             world_edges,
             exports: analysis.exports.clone(),
+            frames: state.doc.frames.clone(),
             kinds: steps::registry()
                 .iter()
                 .map(|kind| KindInfo {
@@ -338,6 +413,149 @@ impl Session {
                 return Err(format!("Node `{id}` does not exist"));
             }
             doc.edges.retain(|e| e.from.node != id && e.to.node != id);
+            Ok(())
+        })
+    }
+
+    /// Removes nodes and/or frames in one undoable step (a multi-select
+    /// delete). Removing only frames is layout: no new revision.
+    pub fn remove_items(&self, ids: &[String]) -> Result<PipelineGraph, String> {
+        let remove = |doc: &mut GraphDoc| -> Result<(), String> {
+            let (nodes, frames) = (doc.nodes.len(), doc.frames.len());
+            doc.nodes.retain(|node| !ids.contains(&node.id));
+            doc.frames.retain(|frame| !ids.contains(&frame.id));
+            if doc.nodes.len() == nodes && doc.frames.len() == frames {
+                return Err("Nothing to remove".to_owned());
+            }
+            doc.edges
+                .retain(|e| !ids.contains(&e.from.node) && !ids.contains(&e.to.node));
+            Ok(())
+        };
+
+        if self.graph_doc().nodes.iter().any(|node| ids.contains(&node.id)) {
+            self.edit(remove)
+        } else {
+            self.layout_edit(remove)
+        }
+    }
+
+    /// Splits the edge `from → to` with a new reroute node (of the edge's
+    /// type) at `position`, as one undoable step.
+    pub fn insert_reroute(
+        &self,
+        from: SocketRef,
+        to: SocketRef,
+        position: (f64, f64),
+    ) -> Result<(String, PipelineGraph), String> {
+        let mut id = String::new();
+
+        let graph = self.edit(|doc| {
+            let index = doc
+                .edges
+                .iter()
+                .position(|e| e.from == from && e.to == to)
+                .ok_or("That connection does not exist")?;
+
+            let source = doc
+                .node(&from.node)
+                .ok_or_else(|| format!("Node `{}` does not exist", from.node))?;
+            let scope = resolve(source)
+                .contract?
+                .outputs
+                .iter()
+                .find(|o| o.name == from.socket)
+                .map(|o| o.scope)
+                .ok_or_else(|| format!("Node `{}` has no output `{}`", from.node, from.socket))?;
+            let kind = match scope {
+                FieldScope::Column => "reroute_column",
+                FieldScope::Voxel => "reroute_voxel",
+                FieldScope::World => return Err("World fields have no wires".to_owned()),
+            };
+
+            id = doc.next_id();
+            doc.nodes.push(NodeDoc {
+                id: id.clone(),
+                kind: kind.to_owned(),
+                enabled: true,
+                position,
+                params: Default::default(),
+                script: None,
+                label: None,
+            });
+            doc.edges[index] = EdgeDoc {
+                from: from.clone(),
+                to: SocketRef {
+                    node: id.clone(),
+                    socket: "in".to_owned(),
+                },
+            };
+            doc.edges.push(EdgeDoc {
+                from: SocketRef {
+                    node: id.clone(),
+                    socket: "out".to_owned(),
+                },
+                to: to.clone(),
+            });
+            Ok(())
+        })?;
+
+        Ok((id, graph))
+    }
+
+    /// Cuts several inputs' edges in one undoable step.
+    pub fn disconnect_many(&self, inputs: &[SocketRef]) -> Result<PipelineGraph, String> {
+        self.edit(|doc| {
+            let before = doc.edges.len();
+            doc.edges.retain(|e| !inputs.contains(&e.to));
+            if doc.edges.len() == before {
+                return Err("None of those inputs is connected".to_owned());
+            }
+            Ok(())
+        })
+    }
+
+    /// Adds a frame (a labelled box behind nodes). Layout only.
+    pub fn add_frame(
+        &self,
+        position: (f64, f64),
+        size: (f64, f64),
+    ) -> Result<(String, PipelineGraph), String> {
+        let mut id = String::new();
+        let graph = self.layout_edit(|doc| {
+            id = doc.next_frame_id();
+            doc.frames.push(FrameDoc {
+                id: id.clone(),
+                label: String::new(),
+                position,
+                size: clamp_frame_size(size),
+            });
+            Ok(())
+        })?;
+
+        Ok((id, graph))
+    }
+
+    /// Changes a frame's label, position and/or size. Layout only.
+    pub fn update_frame(
+        &self,
+        id: &str,
+        label: Option<String>,
+        position: Option<(f64, f64)>,
+        size: Option<(f64, f64)>,
+    ) -> Result<PipelineGraph, String> {
+        self.layout_edit(|doc| {
+            let frame = doc
+                .frame_mut(id)
+                .ok_or_else(|| format!("Frame `{id}` does not exist"))?;
+            if let Some(label) = label {
+                frame.label = label.trim().to_owned();
+            }
+            if let Some(position) = position {
+                frame.position = position;
+            }
+            if let Some(size) = size {
+                frame.size = clamp_frame_size(size);
+            }
             Ok(())
         })
     }
@@ -434,14 +652,74 @@ impl Session {
         })
     }
 
-    /// Layout only: updates positions without publishing a revision.
+    /// Layout only: updates positions without publishing a revision (undoable).
     pub fn move_nodes(&self, moves: &[(String, (f64, f64))]) {
         let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
+        let before = state.doc.clone();
         for (id, position) in moves {
             if let Some(node) = state.doc.node_mut(id) {
                 node.position = *position;
+            } else if let Some(frame) = state.doc.frame_mut(id) {
+                frame.position = *position;
             }
         }
+        state.record(before);
+    }
+
+    /// Replaces the whole document (New / Open) and clears the history.
+    /// Like loading at startup, the new graph is built but not validated, so
+    /// a graph with a broken script still opens. On error nothing changes.
+    pub fn replace_doc(&self, doc: GraphDoc) -> Result<PipelineGraph, String> {
+        {
+            let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
+            let built = build(&doc, Some(&state.active))?;
+            state.publish(doc, built);
+            state.undo.clear();
+            state.redo.clear();
+        }
+
+        Ok(self.pipeline_graph())
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.state.read().unwrap_or_else(|p| p.into_inner()).undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.state.read().unwrap_or_else(|p| p.into_inner()).redo.is_empty()
+    }
+
+    /// Steps back to the previous doc snapshot (layout included).
+    pub fn undo(&self) -> Result<PipelineGraph, String> {
+        self.step_history(true)
+    }
+
+    pub fn redo(&self) -> Result<PipelineGraph, String> {
+        self.step_history(false)
+    }
+
+    fn step_history(&self, undo: bool) -> Result<PipelineGraph, String> {
+        {
+            let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
+            let target = if undo { state.undo.last() } else { state.redo.last() }
+                .cloned()
+                .ok_or_else(|| format!("Nothing to {}", if undo { "undo" } else { "redo" }))?;
+
+            // Snapshots were valid when they were current; building suffices.
+            let built = build(&target, Some(&state.active))?;
+            let current = state.doc.clone();
+
+            if undo {
+                state.undo.pop();
+                state.redo.push(current);
+            } else {
+                state.redo.pop();
+                state.undo.push(current);
+            }
+            state.publish(target, built);
+        }
+
+        Ok(self.pipeline_graph())
     }
 
     /// Replaces a script node's source. Edges stay connected to sockets that
@@ -487,16 +765,40 @@ impl Session {
             let mut doc = state.doc.clone();
             change(&mut doc)?;
 
-            let pipeline = GraphPipeline::build(&doc, self.config, &self.world)?;
-            pipeline.validate(self.config, &self.world)?;
-            state.doc = doc;
-            state.active = Arc::new(Active {
-                revision: state.active.revision + 1,
-                pipeline,
-            });
+            let built = build(&doc, Some(&state.active))?;
+            built.pipeline.validate(built.config, &built.world)?;
+            let previous = std::mem::replace(&mut state.doc, doc.clone());
+            state.record(previous);
+            state.publish(doc, built);
         }
 
         Ok(self.pipeline_graph())
+    }
+
+    /// Like `edit` for changes that cannot affect generation (frames): no
+    /// validation, no new revision, but undoable.
+    fn layout_edit(
+        &self,
+        change: impl FnOnce(&mut GraphDoc) -> Result<(), String>,
+    ) -> Result<PipelineGraph, String> {
+        {
+            let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
+            let mut doc = state.doc.clone();
+            change(&mut doc)?;
+            let previous = std::mem::replace(&mut state.doc, doc);
+            state.record(previous);
+        }
+
+        Ok(self.pipeline_graph())
+    }
+
+    /// Sets the world seed (undoable). Builds a new world stage; the graph
+    /// must still generate under the new seed.
+    pub fn set_seed(&self, seed: u64) -> Result<PipelineGraph, String> {
+        self.edit(|doc| {
+            doc.seed = seed;
+            Ok(())
+        })
     }
 
     /// Samples every world field on a regular grid: sample (i, j) is at
@@ -520,6 +822,8 @@ impl Session {
 
         let (w, h) = (width as usize, height as usize);
         let step_cells = i64::from(step);
+        let world = self.active().world.clone();
+        let world = &*world;
 
         let rows: Vec<Vec<[f32; WorldSample::FIELD_COUNT]>> = (0..h)
             .into_par_iter()
@@ -530,8 +834,8 @@ impl Session {
                     .map(|i| {
                         let x = origin.0 + i as i64 * step_cells;
 
-                        if self.world.contains_column(x, y) {
-                            self.world.sample(x, y).values()
+                        if world.contains_column(x, y) {
+                            world.sample(x, y).values()
                         } else {
                             [f32::NAN; WorldSample::FIELD_COUNT]
                         }
@@ -549,20 +853,36 @@ impl Session {
 
     /// All world fields at one column, or None outside the world.
     pub fn world_point(&self, x: i64, y: i64) -> Option<WorldSample> {
-        self.world
+        let active = self.active();
+        active
+            .world
             .contains_column(x, y)
-            .then(|| self.world.sample(x, y))
+            .then(|| active.world.sample(x, y))
     }
 
     #[cfg(test)]
     fn generate(&self, coord: ChunkCoord) -> Result<Chunk<Voxel, ColumnData>, String> {
-        self.active().pipeline.generate(coord, &self.world)
+        let active = self.active();
+        active.pipeline.generate(coord, &active.world)
+    }
+
+    #[cfg(test)]
+    fn world(&self) -> Arc<WorldStore> {
+        Arc::clone(&self.active().world)
     }
 
     #[cfg(test)]
     fn slot(&self, key: &str) -> usize {
         self.active().pipeline.schema().slot(key).unwrap()
     }
+}
+
+fn clamp_frame_size((width, height): (f64, f64)) -> (f64, f64) {
+    const MIN: f64 = 60.0;
+    (
+        if width.is_finite() { width.max(MIN) } else { MIN },
+        if height.is_finite() { height.max(MIN) } else { MIN },
+    )
 }
 
 /// Latest-ordered active output with this name and type (for auto-connect),
@@ -761,7 +1081,8 @@ mod tests {
         let session = Session::new(3).unwrap();
         let left = session.generate(ChunkCoord(10, 10, 0)).unwrap();
         let right = session.generate(ChunkCoord(11, 10, 0)).unwrap();
-        let world = &session.world;
+        let world_store = session.world();
+        let world = &*world_store;
 
         let elevation = session.slot("n1.elevation");
         let left_edge = left.chunk_data().columns[(31, 5, 0)][elevation];
@@ -858,7 +1179,7 @@ mod tests {
 
         let chunk = session.generate(ChunkCoord(140, 90, 0)).unwrap();
         let (origin, smoothed) = (chunk.origin(), session.slot("n5.smoothed"));
-        let e = |x: i64, y: i64| f64::from(session.world.elevation_at(x, y));
+        let e = |x: i64, y: i64| f64::from(session.world().elevation_at(x, y));
 
         for (x, y) in [(0usize, 0usize), (31, 31), (15, 0)] {
             let (gx, gy) = (origin.0 + x as i64, origin.1 + y as i64);
@@ -888,7 +1209,7 @@ mod tests {
 
         let chunk = session.generate(ChunkCoord(140, 90, 0)).unwrap();
         let (origin, out) = (chunk.origin(), session.slot(&format!("{id}.slope")));
-        let e = |x: i64, y: i64| session.world.elevation_at(x, y);
+        let e = |x: i64, y: i64| session.world().elevation_at(x, y);
 
         for (x, y) in [(0usize, 0usize), (31, 31), (0, 17), (31, 3), (12, 0), (5, 31)] {
             let (gx, gy) = (origin.0 + x as i64, origin.1 + y as i64);
@@ -998,7 +1319,7 @@ mod tests {
         assert_eq!(node(&graph, "n5").position, (123.0, 45.0));
 
         let saved = session.graph_doc().to_json();
-        let reloaded = Session::with_doc(2, GraphDoc::from_json(&saved).unwrap()).unwrap();
+        let reloaded = Session::with_doc(GraphDoc::from_json(&saved).unwrap()).unwrap();
         let again = reloaded.pipeline_graph();
 
         assert_eq!(reloaded.graph_doc(), session.graph_doc());
@@ -1031,6 +1352,89 @@ mod tests {
     }
 
     #[test]
+    fn undo_and_redo_restore_docs_including_layout() {
+        let session = Session::new(2).unwrap();
+        let original = session.graph_doc();
+        assert!(!session.can_undo());
+        assert!(session.undo().is_err());
+
+        session.add_node("humidity", (10.0, 10.0), None).unwrap();
+        session.move_nodes(&[("n5".into(), (99.0, 77.0))]);
+        session.set_label("n4", "terrain").unwrap();
+        let edited = session.graph_doc();
+
+        // Moving to where it already is records nothing.
+        session.move_nodes(&[("n5".into(), (99.0, 77.0))]);
+
+        let graph = session.undo().unwrap();
+        assert_eq!(node(&graph, "n4").label, "height");
+        assert_eq!(node(&graph, "n5").position, (99.0, 77.0));
+        let graph = session.undo().unwrap();
+        assert_eq!(node(&graph, "n5").position, (10.0, 10.0));
+        session.undo().unwrap();
+        assert_eq!(session.graph_doc(), original);
+        assert!(!session.can_undo());
+        assert_eq!(session.world_info().column_fields.len(), 2);
+
+        for _ in 0..3 {
+            session.redo().unwrap();
+        }
+        assert_eq!(session.graph_doc(), edited);
+        assert!(!session.can_redo());
+
+        // A new edit drops the redo branch.
+        session.undo().unwrap();
+        session.set_enabled("n3", false).unwrap();
+        assert!(!session.can_redo());
+    }
+
+    #[test]
+    fn changing_the_seed_rebuilds_the_world_and_is_undoable() {
+        let session = Session::new(10).unwrap();
+        let coord = ChunkCoord(128, 128, 0);
+        let before = session.column_payload(coord).unwrap();
+        let (elevation_a, revision) = (session.world().elevation_at(0, 0), session.pipeline_graph().revision);
+
+        let graph = session.set_seed(u64::MAX).unwrap();
+        let info = session.world_info();
+
+        assert_eq!(graph.revision, revision + 1);
+        assert_eq!(info.seed, u64::MAX);
+        assert_eq!(session.graph_doc().seed, u64::MAX);
+        assert_ne!(session.world().elevation_at(0, 0), elevation_a);
+        assert_ne!(session.column_payload(coord).unwrap()[40..], before[40..]);
+        assert!(serde_json::to_string(&info).unwrap().contains("\"seed\":\"18446744073709551615\""));
+
+        // The seed survives a save/load round trip.
+        let reloaded = Session::with_doc(GraphDoc::from_json(&session.graph_doc().to_json()).unwrap()).unwrap();
+        assert_eq!(reloaded.world_info().seed, u64::MAX);
+
+        session.undo().unwrap();
+        assert_eq!(session.world_info().seed, 10);
+        assert_eq!(session.world().elevation_at(0, 0), elevation_a);
+        assert_eq!(&session.column_payload(coord).unwrap()[40..], &before[40..]);
+
+        // Setting the same seed again is a no-op for history.
+        let undo_len_before = session.can_undo();
+        session.set_seed(10).unwrap();
+        assert_eq!(session.can_undo(), undo_len_before);
+    }
+
+    #[test]
+    fn replacing_the_doc_clears_history_and_publishes_a_revision() {
+        let session = Session::new(2).unwrap();
+        session.add_node("humidity", (0.0, 0.0), None).unwrap();
+        let before = session.pipeline_graph().revision;
+        assert!(session.can_undo());
+
+        let graph = session.replace_doc(steps::default_graph()).unwrap();
+
+        assert_eq!(graph.revision, before + 1);
+        assert_eq!(session.graph_doc(), steps::default_graph());
+        assert!(!session.can_undo() && !session.can_redo());
+    }
+
+    #[test]
     fn default_graph_exports_height_and_labels_rename_exports() {
         let session = Session::new(3).unwrap();
         let info = session.world_info();
@@ -1047,5 +1451,107 @@ mod tests {
         let graph = session.set_label("n4", "").unwrap();
         assert_eq!(graph.exports[0].name, worldgraph::pipeline::DEFAULT_EXPORT_NAME);
         assert!(session.set_label("n99", "x").is_err());
+    }
+
+    #[test]
+    fn frames_are_layout_only_undoable_and_move_with_nodes() {
+        let session = Session::new(2).unwrap();
+        let revision = session.pipeline_graph().revision;
+
+        let (id, graph) = session.add_frame((10.0, 20.0), (300.0, 5.0)).unwrap();
+        assert_eq!(id, "f1");
+        assert_eq!(graph.revision, revision, "frames never publish a revision");
+        assert_eq!(graph.frames[0].size, (300.0, 60.0), "size is clamped");
+
+        let graph = session
+            .update_frame("f1", Some("  Climate ".into()), None, Some((400.0, 250.0)))
+            .unwrap();
+        assert_eq!(graph.frames[0].label, "Climate");
+        assert_eq!(graph.frames[0].size, (400.0, 250.0));
+        assert!(session.update_frame("f9", None, None, None).is_err());
+
+        // Frames move through the same call as nodes (one undo step).
+        session.move_nodes(&[("f1".into(), (50.0, 60.0)), ("n1".into(), (5.0, 5.0))]);
+        let graph = session.pipeline_graph();
+        assert_eq!(graph.frames[0].position, (50.0, 60.0));
+        assert_eq!(node(&graph, "n1").position, (5.0, 5.0));
+        session.undo().unwrap();
+        assert_eq!(session.pipeline_graph().frames[0].position, (10.0, 20.0));
+
+        // Survives a save/load round trip.
+        let saved = session.graph_doc().to_json();
+        assert_eq!(GraphDoc::from_json(&saved).unwrap(), session.graph_doc());
+
+        // Deleting nodes and a frame together is one undo step.
+        let graph = session
+            .remove_items(&["f1".into(), "n3".into(), "n4".into()])
+            .unwrap();
+        assert!(graph.frames.is_empty());
+        assert!(graph.nodes.iter().all(|n| n.id != "n3" && n.id != "n4"));
+        let graph = session.undo().unwrap();
+        assert_eq!(graph.frames.len(), 1);
+        assert!(graph.nodes.iter().any(|n| n.id == "n3"));
+        assert!(graph.nodes.iter().any(|n| n.id == "n4"));
+
+        // Frames-only removal is layout: no new revision.
+        let revision = session.pipeline_graph().revision;
+        let graph = session.remove_items(&["f1".into()]).unwrap();
+        assert_eq!(graph.revision, revision);
+        assert!(session.remove_items(&["f1".into()]).is_err());
+    }
+
+    #[test]
+    fn disconnect_many_is_one_undo_step_and_reroutes_generate() {
+        let session = Session::new(3).unwrap();
+        let original = session.graph_doc();
+
+        let graph = session
+            .disconnect_many(&[socket("n2", "elevation"), socket("n3", "elevation")])
+            .unwrap();
+        assert!(graph.edges.iter().all(|e| e.to.node != "n2" && e.to.node != "n3"));
+        assert!(session.disconnect_many(&[socket("n2", "elevation")]).is_err());
+        session.undo().unwrap();
+        assert_eq!(session.graph_doc(), original);
+
+        // Insert a reroute between elevation and temperature.
+        let (id, _) = session.add_node("reroute_column", (100.0, 0.0), None).unwrap();
+        session.connect(socket("n1", "elevation"), socket(&id, "in")).unwrap();
+        let graph = session
+            .connect(socket(&id, "out"), socket("n2", "elevation"))
+            .unwrap();
+        assert_eq!(node(&graph, &id).status, NodeStatus::Active);
+        assert_eq!(session.world_info().column_fields.len(), 2, "a reroute adds no field");
+
+        // Splitting an edge keeps the wiring working and undoes in one step.
+        let before = session.graph_doc();
+        let (split, graph) = session
+            .insert_reroute(socket("n1", "elevation"), socket("n3", "elevation"), (50.0, 50.0))
+            .unwrap();
+        assert_eq!(node(&graph, &split).kind, "reroute_column");
+        assert_eq!(node(&graph, &split).status, NodeStatus::Active);
+        assert!(graph.edges.iter().any(|e| e.from == socket(&split, "out") && e.to == socket("n3", "elevation")));
+        assert!(session
+            .insert_reroute(socket("n1", "elevation"), socket("n3", "elevation"), (0.0, 0.0))
+            .is_err());
+        session.undo().unwrap();
+        assert_eq!(session.graph_doc(), before);
+
+        // Voxel edges get a voxel reroute.
+        let (export, _) = session.add_node("export_voxel", (0.0, 0.0), None).unwrap();
+        session.connect(socket("n3", "solid"), socket(&export, "value")).unwrap();
+        let (voxel, graph) = session
+            .insert_reroute(socket("n3", "solid"), socket(&export, "value"), (0.0, 0.0))
+            .unwrap();
+        assert_eq!(node(&graph, &voxel).kind, "reroute_voxel");
+        assert_eq!(node(&graph, &voxel).status, NodeStatus::Active);
+        assert_eq!(graph.exports.iter().find(|e| e.name == "export").unwrap().field, "n3.solid");
+
+        let chunk = session.generate(ChunkCoord(128, 128, 0)).unwrap();
+        let temperature = session.slot("n2.temperature");
+        assert!(chunk
+            .chunk_data()
+            .columns
+            .iter()
+            .all(|(c, ..)| c[temperature].is_finite()));
     }
 }
