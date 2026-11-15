@@ -4,15 +4,20 @@ import { CameraHandler } from './camera';
 import { InfiniteGrid } from './grid';
 
 export class SceneManager {
-	public grid: THREE.GridHelper | null = null;
+	public grid: InfiniteGrid | null = null;
 
 	public constructor() {}
 
-	/** Keeps the finite grid centered under the camera, snapped to chunk lines. */
-	public followCamera(x: number, y: number, chunkSize: number): void {
-		if (!this.grid) return;
-		this.grid.position.x = Math.round(x / chunkSize) * chunkSize;
-		this.grid.position.y = Math.round(y / chunkSize) * chunkSize;
+	/** Keeps the grid covering the view; its lines stay on world (chunk) lines. */
+	public followCamera(
+		bounds: { minX: number; minY: number; maxX: number; maxY: number },
+		chunkSize: number
+	): void {
+		this.grid?.cover(bounds.minX, bounds.minY, bounds.maxX, bounds.maxY, chunkSize);
+	}
+
+	public setGridVisible(visible: boolean): void {
+		if (this.grid) this.grid.mesh.visible = visible;
 	}
 
 	public initializeDefaultScene(parentComponent: HTMLElement) {
@@ -23,13 +28,11 @@ export class SceneManager {
 		context.setCamera(new CameraHandler(parentComponent, 96));
 		context.setParentComponent(parentComponent);
 
-		// One line per 32-cell chunk; drawn just above the tiles.
-		// Follows the camera (followCamera), so it only needs to cover the view.
-		const grid = InfiniteGrid.create(8192, 256);
-		grid.position.z = 0.1;
-		this.grid = grid;
+		// Lines on chunk borders (coarser when zoomed out); covers the view
+		// (followCamera) while its lines stay fixed in the world.
+		this.grid = new InfiniteGrid(32);
 		context.scene.background = new THREE.Color(0x1f2129);
-		context.scene.add(grid);
+		context.scene.add(this.grid.mesh);
 		this.update();
 	}
 

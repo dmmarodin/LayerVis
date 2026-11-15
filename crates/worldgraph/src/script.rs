@@ -28,7 +28,7 @@ use rhai::{CallFnOptions, Dynamic, Engine, Map, Scope, AST, FLOAT, INT};
 use crate::{
     pipeline::{Bindings, Contract, FieldSpec, InputSpec},
     world::WorldStore,
-    ColumnData, FieldScope, Voxel,
+    ColumnData, FieldScope, ValueKind, Voxel,
 };
 
 /// Ramps the frontend knows; anything else in an `output:` entry is the unit.
@@ -187,6 +187,8 @@ impl ScriptDef {
                     .map(|name| InputSpec {
                         name: Cow::Owned(name),
                         scope: FieldScope::Column,
+                        kind: ValueKind::Scalar,
+                        optional: false,
                     })
                     .collect(),
                 outputs: writes,
@@ -221,6 +223,7 @@ fn parse_write(value: &str) -> Result<FieldSpec, String> {
     Ok(FieldSpec {
         name: Cow::Owned(name.to_owned()),
         scope: FieldScope::Column,
+        kind: ValueKind::Scalar,
         unit: Cow::Owned(unit.join(" ")),
         min,
         max,

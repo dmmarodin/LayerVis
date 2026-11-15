@@ -12,8 +12,11 @@ use layergen::{
 
 use crate::{
     atlas::{RASTERIZE, REROUTE_ATLAS, SAMPLE},
-    climate::{HUMIDITY, TEMPERATURE},
-    geology::{EROSION, FLOW, TECTONIC_UPLIFT},
+    biomes::BIOME,
+    climate::{HUMIDITY, MOISTURE, SEASONS, TEMPERATURE, WIND},
+    detail::{RIVER_CARVE, SCATTER, TERRAIN_DETAIL},
+    geology::{EROSION, FLOW, GEOLOGY, TECTONIC_UPLIFT},
+    strata::{EXPORT_MATERIAL, STRATA, STRATA_FILL},
     graph::{EdgeDoc, GraphDoc, NodeDoc, SocketRef},
     pipeline::{
         Bindings, BoxedNeighborhoodStep, BoxedStep, BoxedWorldStep, Build, FieldSpec, InputSpec,
@@ -21,10 +24,10 @@ use crate::{
     },
     terrain::{EDGE_FALLOFF, TECTONICS, TECTONIC_ELEVATION},
     world::WorldStore,
-    ColumnData, FieldScope, Voxel, WORLD_SLOTS,
+    ColumnData, FieldScope, ValueKind, Voxel, WORLD_SLOTS,
 };
 
-static REGISTRY: [&NodeKind; 21] = [
+static REGISTRY: [&NodeKind; 32] = [
     &TECTONICS,
     &TECTONIC_ELEVATION,
     &EDGE_FALLOFF,
@@ -46,6 +49,17 @@ static REGISTRY: [&NodeKind; 21] = [
     &TECTONIC_UPLIFT,
     &EROSION,
     &FLOW,
+    &STRATA,
+    &STRATA_FILL,
+    &EXPORT_MATERIAL,
+    &WIND,
+    &MOISTURE,
+    &SEASONS,
+    &BIOME,
+    &TERRAIN_DETAIL,
+    &RIVER_CARVE,
+    &SCATTER,
+    &GEOLOGY,
 ];
 
 /// Every registered built-in node kind.
@@ -67,7 +81,7 @@ pub struct GraphTemplate {
 
 /// Starting graphs: the original scattered-land world and a few continent
 /// layouts (each ends in an edge falloff, so the map is ocean all round).
-pub static TEMPLATES: [GraphTemplate; 6] = [
+pub static TEMPLATES: [GraphTemplate; 7] = [
     GraphTemplate {
         id: "default",
         label: "Default (scattered land)",
@@ -125,8 +139,18 @@ pub static TEMPLATES: [GraphTemplate; 6] = [
     GraphTemplate {
         id: "eroded_continent",
         label: "Eroded continent (atlas)",
-        description: "One continent shaped by tectonic uplift and stream-power erosion on the                       atlas, with lakes and rivers from the flow node.",
+        description: "One continent shaped by tectonic uplift and stream-power erosion on \
+                      rock strata, with wind and rain, lakes and rivers, seasons, biomes, \
+                      carved rivers, trees and voxel materials.",
         build: eroded_graph,
+    },
+    GraphTemplate {
+        id: "geological_epochs",
+        label: "Geological epochs (atlas)",
+        description: "The eroded continent, shaped over several epochs instead: plates \
+                      drift, the sea rises and falls, glaciers carve in cold epochs and \
+                      flooded land gathers sediment. Slower to build.",
+        build: epochs_graph,
     },
 ];
 
@@ -222,8 +246,16 @@ fn terrain_graph(tectonics: &[(&str, f64)], falloff: Option<&[(&str, f64)]>) -> 
     }
 }
 
-/// tectonics → elevation + uplift → rasterize → erosion → flow, with the eroded
-/// elevation sampled back to world scope and pulled to the sea at the edges.
+/// The atlas world (Track A): tectonics → elevation (pulled to the sea at the
+/// edges) and uplift → rasterize → strata and climate (wind → moisture) →
+/// erosion on the strata with rain → flow (lakes, rivers) → seasons and
+/// biomes; back at world scope a bicubic sample of the eroded elevation gets
+/// biome-scaled detail and carved rivers; exports for the game: `height`,
+/// `biome`, `surface_material`, `river_depth`, `tree` and the voxel
+/// `material` from `strata_fill`.
+///
+/// Ids n1 … n12 keep the original eroded template's kinds (erosion = n6,
+/// flow = n7, the `height` export = n12).
 pub fn eroded_graph() -> GraphDoc {
     let node = |id: &str, kind: &str, x: f64, y: f64, params: &[(&str, f64)]| NodeDoc {
         id: id.into(),
@@ -233,6 +265,10 @@ pub fn eroded_graph() -> GraphDoc {
         params: params.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect(),
         script: None,
         label: None,
+    };
+    let named = |id: &str, kind: &str, x: f64, y: f64, label: &str| NodeDoc {
+        label: Some(label.into()),
+        ..node(id, kind, x, y, &[])
     };
     let edge = |from: &str, out: &str, to: &str, input: &str| EdgeDoc {
         from: SocketRef {
@@ -251,23 +287,41 @@ pub fn eroded_graph() -> GraphDoc {
         ("continental_fraction", 0.3),
     ];
     let falloff = [("margin", 0.08), ("falloff", 0.14), ("noise", 0.05)];
-    let mut nodes = vec![
+    let nodes = vec![
         node("n1", "tectonics", 0.0, 0.0, &tectonics),
         node("n2", "tectonic_elevation", 340.0, -80.0, &[]),
         node("n3", "tectonic_uplift", 340.0, 160.0, &[]),
-        node("n4", "rasterize", 680.0, -80.0, &[("supersample", 2.0)]),
+        node("n4", "rasterize", 1020.0, -80.0, &[("supersample", 2.0)]),
         node("n5", "rasterize", 680.0, 160.0, &[]),
-        node("n6", "erosion", 1020.0, 0.0, &[]),
-        node("n7", "flow", 1360.0, 160.0, &[]),
-        node("n8", "sample", 1360.0, -80.0, &[]),
-        node("n9", "edge_falloff", 1700.0, -80.0, &falloff),
-        node("n10", "temperature", 2040.0, -140.0, &[]),
-        node("n11", "solid", 2040.0, 40.0, &[]),
+        node("n6", "erosion", 1700.0, 0.0, &[]),
+        node("n7", "flow", 2040.0, 160.0, &[("river_threshold", 250.0)]),
+        node("n8", "sample", 2380.0, -80.0, &[("mode", 2.0)]),
+        node("n9", "edge_falloff", 680.0, -80.0, &falloff),
+        node("n10", "temperature", 3400.0, -260.0, &[]),
+        node("n11", "solid", 3400.0, -80.0, &[]),
+        named("n12", "export_column", 3400.0, 100.0, "height"),
+        node("n13", "rasterize", 680.0, 360.0, &[]),
+        node("n14", "rasterize", 680.0, 480.0, &[]),
+        node("n15", "rasterize", 680.0, 600.0, &[]),
+        node("n16", "strata", 1360.0, 400.0, &[]),
+        node("n17", "wind", 1020.0, -360.0, &[]),
+        node("n18", "moisture", 1360.0, -300.0, &[]),
+        node("n19", "seasons", 2380.0, -400.0, &[]),
+        node("n20", "biome", 2720.0, -400.0, &[]),
+        node("n21", "sample", 3060.0, -560.0, &[("mode", 0.0)]),
+        named("n22", "export_column", 3400.0, -560.0, "biome"),
+        node("n23", "sample", 3060.0, -400.0, &[]),
+        node("n24", "terrain_detail", 2720.0, -80.0, &[]),
+        node("n25", "river_carve", 3060.0, -80.0, &[]),
+        named("n26", "export_column", 3400.0, 280.0, "river_depth"),
+        node("n27", "sample", 3060.0, -720.0, &[]),
+        node("n28", "scatter", 3400.0, -720.0, &[]),
+        named("n29", "export_column", 3740.0, -720.0, "tree"),
+        node("n30", "sample", 2380.0, 400.0, &[("mode", 0.0)]),
+        named("n31", "export_column", 3400.0, 400.0, "surface_material"),
+        node("n32", "strata_fill", 3400.0, 560.0, &[]),
+        named("n33", "export_material", 3740.0, 560.0, "material"),
     ];
-    nodes.push(NodeDoc {
-        label: Some("height".into()),
-        ..node("n12", "export_column", 2040.0, 220.0, &[])
-    });
 
     let mut edges = Vec::new();
     for socket in [
@@ -280,16 +334,60 @@ pub fn eroded_graph() -> GraphDoc {
         edges.push(edge("n1", socket, "n3", socket));
     }
     edges.extend([
-        edge("n2", "elevation", "n4", "in"),
+        // Terrain and uplift onto the atlas (the edge falloff first, so the
+        // atlas sees the ocean border).
+        edge("n2", "elevation", "n9", "elevation"),
+        edge("n9", "elevation", "n4", "in"),
         edge("n3", "uplift", "n5", "in"),
+        edge("n1", "continental", "n13", "in"),
+        edge("n1", "boundary_distance", "n14", "in"),
+        edge("n1", "convergence", "n15", "in"),
+        // Strata and climate.
+        edge("n13", "out", "n16", "continental"),
+        edge("n14", "out", "n16", "boundary_distance"),
+        edge("n15", "out", "n16", "convergence"),
+        edge("n4", "out", "n16", "elevation"),
+        edge("n4", "out", "n18", "elevation"),
+        edge("n17", "wind_u", "n18", "wind_u"),
+        edge("n17", "wind_v", "n18", "wind_v"),
+        // Erosion on the strata with rain, then flow.
         edge("n4", "out", "n6", "elevation"),
         edge("n5", "out", "n6", "uplift"),
+        edge("n16", "strata", "n6", "strata"),
+        edge("n18", "precipitation", "n6", "precipitation"),
         edge("n6", "elevation", "n7", "elevation"),
+        edge("n18", "precipitation", "n7", "precipitation"),
+        // Seasons and biomes on the eroded terrain.
+        edge("n6", "elevation", "n19", "elevation"),
+        edge("n18", "precipitation", "n19", "precipitation"),
+        edge("n6", "elevation", "n20", "elevation"),
+        edge("n19", "temperature", "n20", "temperature"),
+        edge("n18", "precipitation", "n20", "precipitation"),
+        edge("n7", "lake_depth", "n20", "lake_depth"),
+        edge("n7", "discharge", "n20", "discharge"),
+        // Back to world scope: smooth elevation + detail + rivers.
         edge("n6", "elevation", "n8", "in"),
-        edge("n8", "out", "n9", "elevation"),
-        edge("n9", "elevation", "n10", "elevation"),
-        edge("n9", "elevation", "n11", "elevation"),
-        edge("n9", "elevation", "n12", "value"),
+        edge("n20", "roughness", "n23", "in"),
+        edge("n8", "out", "n24", "elevation"),
+        edge("n23", "out", "n24", "roughness"),
+        edge("n24", "elevation", "n25", "elevation"),
+        edge("n7", "rivers", "n25", "rivers"),
+        edge("n20", "biome", "n21", "in"),
+        edge("n20", "tree_density", "n27", "in"),
+        edge("n27", "out", "n28", "density"),
+        edge("n6", "surface_material", "n30", "in"),
+        // Game exports and voxels.
+        edge("n25", "elevation", "n10", "elevation"),
+        edge("n25", "elevation", "n11", "elevation"),
+        edge("n25", "elevation", "n12", "value"),
+        edge("n21", "out", "n22", "value"),
+        edge("n25", "river_depth", "n26", "value"),
+        edge("n28", "points", "n29", "value"),
+        edge("n30", "out", "n31", "value"),
+        edge("n25", "elevation", "n32", "elevation"),
+        edge("n6", "strata", "n32", "strata"),
+        edge("n25", "water_level", "n32", "water_level"),
+        edge("n32", "material", "n33", "value"),
     ]);
 
     GraphDoc {
@@ -303,10 +401,33 @@ pub fn eroded_graph() -> GraphDoc {
     }
 }
 
+/// The atlas world with `geology` (moving plates, sea-level cycles,
+/// glaciers, several erosion epochs) in place of `erosion` (n6).
+pub fn epochs_graph() -> GraphDoc {
+    let mut doc = eroded_graph();
+    // geology computes its own uplift from moving plates.
+    doc.nodes.retain(|n| n.id != "n3" && n.id != "n5");
+    doc.edges
+        .retain(|e| !["n3", "n5"].contains(&e.from.node.as_str()) && e.to.node != "n3");
+    let geology = doc.node_mut("n6").expect("n6 is erosion");
+    geology.kind = "geology".into();
+    geology.params = [
+        ("plate_size", 1100.0),
+        ("continents", 1.0),
+        ("continental_fraction", 0.3),
+    ]
+    .iter()
+    .map(|(k, v)| ((*k).to_owned(), *v))
+    .collect();
+    doc
+}
+
 const fn input(name: &'static str) -> InputSpec {
     InputSpec {
         name: Cow::Borrowed(name),
         scope: FieldScope::Column,
+        kind: ValueKind::Scalar,
+        optional: false,
     }
 }
 
@@ -320,6 +441,7 @@ const fn column(
     FieldSpec {
         name: Cow::Borrowed(name),
         scope: FieldScope::Column,
+        kind: ValueKind::Scalar,
         unit: Cow::Borrowed(unit),
         min,
         max,
@@ -415,6 +537,7 @@ pub static SMOOTH: NodeKind = NodeKind {
     outputs: &[FieldSpec {
         name: Cow::Borrowed("smoothed"),
         scope: FieldScope::Column,
+        kind: ValueKind::Scalar,
         unit: Cow::Borrowed(""),
         min: 0.0,
         max: 1.0,
@@ -493,6 +616,7 @@ pub static SOLID: NodeKind = NodeKind {
     outputs: &[FieldSpec {
         name: Cow::Borrowed("solid"),
         scope: FieldScope::Voxel,
+        kind: ValueKind::Scalar,
         unit: Cow::Borrowed(""),
         min: 0.0,
         max: 1.0,
@@ -555,6 +679,8 @@ pub static EXPORT_VOXEL: NodeKind = NodeKind {
     inputs: &[InputSpec {
         name: Cow::Borrowed("value"),
         scope: FieldScope::Voxel,
+        kind: ValueKind::Scalar,
+        optional: false,
     }],
     outputs: &[],
     params: &[],
@@ -571,6 +697,7 @@ pub static REROUTE_COLUMN: NodeKind = NodeKind {
     outputs: &[FieldSpec {
         name: Cow::Borrowed("out"),
         scope: FieldScope::Column,
+        kind: ValueKind::Scalar,
         unit: Cow::Borrowed(""),
         min: 0.0,
         max: 1.0,
@@ -589,10 +716,13 @@ pub static REROUTE_VOXEL: NodeKind = NodeKind {
     inputs: &[InputSpec {
         name: Cow::Borrowed("in"),
         scope: FieldScope::Voxel,
+        kind: ValueKind::Scalar,
+        optional: false,
     }],
     outputs: &[FieldSpec {
         name: Cow::Borrowed("out"),
         scope: FieldScope::Voxel,
+        kind: ValueKind::Scalar,
         unit: Cow::Borrowed(""),
         min: 0.0,
         max: 1.0,
@@ -616,6 +746,7 @@ const fn world_field(
     FieldSpec {
         name: Cow::Borrowed(name),
         scope: FieldScope::World,
+        kind: ValueKind::Scalar,
         unit: Cow::Borrowed(unit),
         min,
         max,
@@ -628,6 +759,8 @@ const fn world_input(name: &'static str) -> InputSpec {
     InputSpec {
         name: Cow::Borrowed(name),
         scope: FieldScope::World,
+        kind: ValueKind::Scalar,
+        optional: false,
     }
 }
 

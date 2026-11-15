@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use layergen::{ChunkCoord, ChunkSize, PipelineConfig, WorldBounds};
 use worldgraph::{
+    SocketType,
     steps, EdgeDoc, FieldScope, GraphDoc, GraphPipeline, NodeDoc, NodeStatus, SocketRef, WorldStore,
 };
 
@@ -190,24 +191,24 @@ fn wires_only_run_downward_through_the_scopes() {
     assert_eq!(report(&graph, "n4").status, NodeStatus::Blocked);
 
     assert!(worldgraph::can_connect(
-        FieldScope::World,
-        FieldScope::Column
+        SocketType::scalar(FieldScope::World),
+        SocketType::scalar(FieldScope::Column),
     ));
     assert!(worldgraph::can_connect(
-        FieldScope::World,
-        FieldScope::World
+        SocketType::scalar(FieldScope::World),
+        SocketType::scalar(FieldScope::World),
     ));
     assert!(!worldgraph::can_connect(
-        FieldScope::Column,
-        FieldScope::World
+        SocketType::scalar(FieldScope::Column),
+        SocketType::scalar(FieldScope::World),
     ));
     assert!(!worldgraph::can_connect(
-        FieldScope::Voxel,
-        FieldScope::Column
+        SocketType::scalar(FieldScope::Voxel),
+        SocketType::scalar(FieldScope::Column),
     ));
     assert!(!worldgraph::can_connect(
-        FieldScope::World,
-        FieldScope::Voxel
+        SocketType::scalar(FieldScope::World),
+        SocketType::scalar(FieldScope::Voxel),
     ));
 }
 

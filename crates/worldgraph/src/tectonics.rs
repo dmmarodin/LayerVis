@@ -109,6 +109,27 @@ impl Tectonics {
         &self.plates
     }
 
+    /// The same layout after the plates moved for `time` (abstract) time
+    /// units: every center moves by velocity × time (negative = the past).
+    /// Plate kinds, warp and ids stay, so boundaries shift and collide.
+    pub fn moved(&self, time: f64) -> Self {
+        Self {
+            seed: self.seed,
+            plates: self
+                .plates
+                .iter()
+                .map(|plate| Plate {
+                    center: (
+                        plate.center.0 + plate.velocity.0 * time,
+                        plate.center.1 + plate.velocity.1 * time,
+                    ),
+                    ..*plate
+                })
+                .collect(),
+            warp_amplitude: self.warp_amplitude,
+        }
+    }
+
     pub fn sample(&self, x: i64, y: i64) -> PlateSample {
         let (x, y) = (x as f64, y as f64);
 

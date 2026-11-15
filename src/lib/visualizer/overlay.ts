@@ -35,12 +35,63 @@ interface GridRequest {
  * tiles. Works at any zoom, so it is the zoomed-out view and the backdrop
  * while chunks stream in.
  */
+/** Height slice settings (the level slider beside the map). */
+export interface SliceView {
+	enabled: boolean;
+	/** World field index of the terrain height (cells), or null. */
+	heightField: number | null;
+	/** The level shown (cells). */
+	level: number;
+	/** Depth (cells) over which lower ground fades into fog. */
+	fogDepth: number;
+	seaLevel: number;
+}
+
+const sliceVertex = /* glsl */ `
+	varying vec2 vUv;
+	void main() {
+		vUv = uv;
+		gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+	}
+`;
+
+/**
+ * Drawn over the map: ground above the level is cut away (dark hatching, as
+ * a slicer shows the part above the current layer), ground at the level is
+ * untouched, and lower ground fades into fog the further down it is (water
+ * blue below sea level).
+ */
+const sliceFragment = /* glsl */ `
+	uniform sampler2D height;
+	uniform float level;
+	uniform float fogDepth;
+	uniform float seaLevel;
+	varying vec2 vUv;
+
+	void main() {
+		float h = texture2D(height, vUv).r;
+		if (isnan(h)) discard;
+		if (h >= level + 1.0) {
+			float stripe = step(0.5, fract((gl_FragCoord.x + gl_FragCoord.y) / 10.0));
+			gl_FragColor = vec4(vec3(0.07, 0.075, 0.09), mix(0.72, 0.86, stripe));
+			return;
+		}
+		if (h >= level) discard; // the current layer
+		float depth = (level - h) / max(fogDepth, 1.0);
+		float fog = 1.0 - exp(-2.2 * depth);
+		vec3 haze = level <= seaLevel ? vec3(0.05, 0.16, 0.36) : vec3(0.55, 0.62, 0.72);
+		gl_FragColor = vec4(haze, clamp(fog, 0.0, 0.92));
+	}
+`;
+
 export class WorldOverlay {
 	public readonly mesh: THREE.Mesh<THREE.PlaneGeometry, THREE.ShaderMaterial>;
 	private grid: FieldGrid | null = null;
 	private textures: THREE.DataTexture[] = [];
 	private field: number | null = null;
 	private view: ViewMode | null = null;
+	private slice: SliceView | null = null;
+	private readonly sliceMesh: THREE.Mesh<THREE.PlaneGeometry, THREE.ShaderMaterial>;
 
 	/** Bumped by `invalidate`; samples requested before it are discarded. */
 	private epoch = 0;
@@ -57,6 +108,35 @@ export class WorldOverlay {
 		this.mesh.position.z = -0.5;
 		this.mesh.visible = false;
 		scene.add(this.mesh);
+
+		this.sliceMesh = new THREE.Mesh(
+			new THREE.PlaneGeometry(1, 1),
+			new THREE.ShaderMaterial({
+				vertexShader: sliceVertex,
+				fragmentShader: sliceFragment,
+				transparent: true,
+				depthWrite: false,
+				uniforms: {
+					height: { value: null },
+					level: { value: 0 },
+					fogDepth: { value: 24 },
+					seaLevel: { value: 0 }
+				}
+			})
+		);
+		this.sliceMesh.visible = false;
+		this.sliceMesh.renderOrder = 2;
+		scene.add(this.sliceMesh);
+	}
+
+	/** Shows or hides the height slice; samples the world while it is on. */
+	public setSlice(slice: SliceView): void {
+		this.slice = slice;
+		this.refreshMaterial();
+	}
+
+	private get sliceActive(): boolean {
+		return !!this.slice?.enabled && this.slice.heightField !== null;
 	}
 
 	/** Shows world field `field` (index into worldFields), or hides the overlay. */
@@ -85,7 +165,7 @@ export class WorldOverlay {
 
 	/** Requests a new grid for the viewport unless the current one still covers it. */
 	public update(bounds: ViewBounds, viewportPixels: number): void {
-		if (this.field === null) return;
+		if (this.field === null && !this.sliceActive) return;
 
 		const request = this.plan(bounds, viewportPixels);
 		if (this.covers(bounds, request.step)) return;
@@ -164,6 +244,9 @@ export class WorldOverlay {
 		const spanY = grid.height * grid.step;
 		this.mesh.scale.set(spanX, spanY, 1);
 		this.mesh.position.set(grid.originX + spanX / 2, grid.originY + spanY / 2, -0.5);
+		this.sliceMesh.scale.set(spanX, spanY, 1);
+		// Above chunk tiles and atlas grids, below river lines.
+		this.sliceMesh.position.set(grid.originX + spanX / 2, grid.originY + spanY / 2, 0.3);
 		this.refreshMaterial();
 	}
 
@@ -171,11 +254,25 @@ export class WorldOverlay {
 		const texture = this.field === null ? null : (this.textures[this.field] ?? null);
 		this.mesh.visible = texture !== null;
 		if (this.view) applyFieldView(this.mesh.material, texture, this.view);
+
+		const slice = this.slice;
+		const height =
+			this.sliceActive && slice?.heightField != null
+				? (this.textures[slice.heightField] ?? null)
+				: null;
+		this.sliceMesh.visible = height !== null;
+		if (slice) {
+			const u = this.sliceMesh.material.uniforms;
+			u.height.value = height;
+			u.level.value = slice.level;
+			u.fogDepth.value = slice.fogDepth;
+			u.seaLevel.value = slice.seaLevel;
+		}
 	}
 
 	private emit(): void {
 		this.onStats({
-			step: this.grid && this.field !== null ? this.grid.step : 0,
+			step: this.grid && (this.field !== null || this.sliceActive) ? this.grid.step : 0,
 			loading: this.inFlight,
 			error: this.error
 		});

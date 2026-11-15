@@ -156,7 +156,7 @@
 	function scopeOf(nodeId: string, handle: string | null | undefined, output: boolean) {
 		const node = graph?.nodes.find((n) => n.id === nodeId);
 		const sockets = output ? node?.outputs : node?.inputs;
-		return sockets?.find((s) => s.name === handle)?.scope ?? null;
+		return sockets?.find((s) => s.name === handle) ?? null;
 	}
 
 	/** Client-side check while dragging; the backend re-validates (incl. cycles). */

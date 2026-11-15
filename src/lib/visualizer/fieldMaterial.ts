@@ -1,8 +1,58 @@
 import * as THREE from 'three';
-import type { FieldGrid } from '../bridge';
+import type { FieldGrid, PaletteEntry } from '../bridge';
 
-export const RAMPS = ['grayscale', 'terrain', 'thermal', 'diverging', 'categorical'] as const;
+export const RAMPS = [
+	'grayscale',
+	'terrain',
+	'thermal',
+	'diverging',
+	'categorical',
+	'material',
+	'biome'
+] as const;
 export type Ramp = (typeof RAMPS)[number];
+
+/** Ramps that color integer ids from a world table (min/max ignored). */
+export type PaletteRamp = 'material' | 'biome';
+export const isPaletteRamp = (ramp: string): ramp is PaletteRamp =>
+	ramp === 'material' || ramp === 'biome';
+/** Ramps without a min/max range. */
+export const isCategoricalRamp = (ramp: string) => ramp === 'categorical' || isPaletteRamp(ramp);
+
+/** Ids per palette uniform (keep in sync with the GLSL array size). */
+const PALETTE_SIZE = 64;
+
+/**
+ * Shared palette uniforms: every field material references these objects,
+ * so `setPalettes` recolors all tiles at once.
+ */
+const palettes: Record<PaletteRamp, { value: THREE.Vector3[] }> = {
+	material: { value: Array.from({ length: PALETTE_SIZE }, () => new THREE.Vector3(1, 0, 1)) },
+	biome: { value: Array.from({ length: PALETTE_SIZE }, () => new THREE.Vector3(1, 0, 1)) }
+};
+let paletteEntries: Record<PaletteRamp, PaletteEntry[]> = { material: [], biome: [] };
+
+/** Installs the world's material and biome tables (WorldInfo). */
+export function setPalettes(materials: PaletteEntry[], biomes: PaletteEntry[]): void {
+	paletteEntries = { material: materials, biome: biomes };
+	for (const ramp of ['material', 'biome'] as const) {
+		palettes[ramp].value.forEach((color, id) => {
+			const entry = paletteEntries[ramp][id];
+			if (entry) color.set(entry.color[0] / 255, entry.color[1] / 255, entry.color[2] / 255);
+			else color.set(1, 0, 1); // unknown id: magenta
+		});
+	}
+}
+
+/** The table entry of an id shown with a palette ramp. */
+export function paletteEntry(ramp: PaletteRamp, value: number): PaletteEntry | null {
+	return paletteEntries[ramp][Math.round(value)] ?? null;
+}
+
+/** Every entry of a palette (legend). */
+export function paletteList(ramp: PaletteRamp): PaletteEntry[] {
+	return paletteEntries[ramp];
+}
 
 export type FieldSource = 'column' | 'world' | 'atlas';
 
@@ -38,6 +88,8 @@ const fragmentShader = /* glsl */ `
 	uniform float maxValue;
 	uniform int ramp;
 	uniform bool hidden;
+	uniform vec3 materialPalette[64];
+	uniform vec3 biomePalette[64];
 	varying vec2 vUv;
 
 	vec3 terrain(float t) {
@@ -72,6 +124,11 @@ const fragmentShader = /* glsl */ `
 		return hsv(hue, 0.55, shade);
 	}
 
+	vec3 palette(float value, bool biome) {
+		int id = int(clamp(floor(value + 0.5), 0.0, 63.0));
+		return biome ? biomePalette[id] : materialPalette[id];
+	}
+
 	void main() {
 		if (hidden) discard; // no field to show (not computed yet / none)
 		float value = texture2D(field, vUv).r;
@@ -83,6 +140,8 @@ const fragmentShader = /* glsl */ `
 			ramp == 2 ? thermal(t) :
 			ramp == 3 ? diverging(t) :
 			ramp == 4 ? categorical(value) :
+			ramp == 5 ? palette(value, false) :
+			ramp == 6 ? palette(value, true) :
 			vec3(t);
 		gl_FragColor = vec4(color, 1.0);
 	}
@@ -94,7 +153,7 @@ type Stop = [position: number, r: number, g: number, b: number];
  * Color stops mirroring the shader ramps, for the sidebar legend only.
  * Keep in sync with the GLSL above (repeated positions are hard edges).
  */
-const RAMP_STOPS: Record<Exclude<Ramp, 'categorical'>, Stop[]> = {
+const RAMP_STOPS: Record<Exclude<Ramp, 'categorical' | PaletteRamp>, Stop[]> = {
 	grayscale: [
 		[0, 0, 0, 0],
 		[1, 1, 1, 1]
@@ -125,7 +184,7 @@ const RAMP_STOPS: Record<Exclude<Ramp, 'categorical'>, Stop[]> = {
 
 /** CSS gradient of a ramp (left = min, right = max); null for categorical. */
 export function rampGradient(ramp: Ramp): string | null {
-	if (ramp === 'categorical') return null;
+	if (ramp === 'categorical' || isPaletteRamp(ramp)) return null;
 
 	const channel = (value: number) => Math.round(value * 255);
 	const stops = RAMP_STOPS[ramp].map(
@@ -160,7 +219,9 @@ export function createFieldMaterial(): THREE.ShaderMaterial {
 			minValue: { value: 0 },
 			maxValue: { value: 1 },
 			ramp: { value: 0 },
-			hidden: { value: true }
+			hidden: { value: true },
+			materialPalette: palettes.material,
+			biomePalette: palettes.biome
 		}
 	});
 }

@@ -110,6 +110,40 @@ export class Visualizer {
 		this.refreshView();
 	}
 
+	/** Height slice (level slider): cut above `level`, fog below. */
+	public setSlice(enabled: boolean, level: number, fogDepth: number): void {
+		this.sliceSettings = { enabled, level, fogDepth };
+		this.refreshSlice();
+		this.scheduleUpdate();
+	}
+
+	private sliceSettings = { enabled: false, level: 0, fogDepth: 24 };
+
+	private refreshSlice(): void {
+		const world = this.world;
+		if (!world || !this.overlay) return;
+		// The terrain height: the last world output named `elevation`, as the
+		// backend's world statistics read it.
+		const fields = world.worldFields;
+		let heightField: number | null = null;
+		for (let i = fields.length - 1; i >= 0; i--) {
+			if (fields[i].name === 'elevation') {
+				heightField = i;
+				break;
+			}
+		}
+		this.overlay.setSlice({
+			...this.sliceSettings,
+			enabled: this.sliceSettings.enabled && !world.atlas.pending,
+			heightField,
+			seaLevel: world.dimensions[2] * 0.3
+		});
+	}
+
+	public setGrid(visible: boolean): void {
+		this.scene.setGridVisible(visible);
+	}
+
 	public setRivers(visible: boolean): void {
 		this.showRivers = visible;
 		this.refreshRivers();
@@ -264,6 +298,7 @@ export class Visualizer {
 		this.streamer?.setEnabled(isColumn && !atlasShown);
 		this.streamer?.applyView(this.view);
 		this.overlay?.setField(overlayField, this.view);
+		this.refreshSlice();
 		this.refreshAtlas();
 		this.scheduleUpdate();
 	}
@@ -286,7 +321,7 @@ export class Visualizer {
 			const bounds = context.camera.viewBounds();
 			const chunkSize = this.world?.chunkSize[0] ?? 32;
 
-			this.scene.followCamera(bounds.centerX, bounds.centerY, chunkSize);
+			this.scene.followCamera(bounds, chunkSize);
 			this.streamer?.update(bounds);
 			this.overlay?.update(bounds, context.parentComponent.clientWidth);
 		});

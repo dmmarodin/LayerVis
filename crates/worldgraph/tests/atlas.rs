@@ -11,6 +11,7 @@ use std::{
 
 use layergen::{ChunkCoord, ChunkSize, PipelineConfig, WorldBounds};
 use worldgraph::{
+    SocketType,
     steps, world_signature, Atlas, AtlasHooks, AtlasProgress, EdgeDoc, Extent, FieldScope,
     GraphDoc, GraphPipeline, NodeDoc, NodeStatus, SocketRef, WorldStore, ATLAS_CANCELLED,
 };
@@ -101,20 +102,20 @@ fn slot_of(graph: &GraphPipeline, key: &str) -> usize {
 #[test]
 fn world_and_atlas_connect_only_through_adapters() {
     assert!(worldgraph::can_connect(
-        FieldScope::Atlas,
-        FieldScope::Atlas
+        SocketType::scalar(FieldScope::Atlas),
+        SocketType::scalar(FieldScope::Atlas),
     ));
     assert!(!worldgraph::can_connect(
-        FieldScope::World,
-        FieldScope::Atlas
+        SocketType::scalar(FieldScope::World),
+        SocketType::scalar(FieldScope::Atlas),
     ));
     assert!(!worldgraph::can_connect(
-        FieldScope::Atlas,
-        FieldScope::World
+        SocketType::scalar(FieldScope::Atlas),
+        SocketType::scalar(FieldScope::World),
     ));
     assert!(!worldgraph::can_connect(
-        FieldScope::Atlas,
-        FieldScope::Column
+        SocketType::scalar(FieldScope::Atlas),
+        SocketType::scalar(FieldScope::Column),
     ));
 
     // A world output wired straight into erosion is an invalid edge.
@@ -203,15 +204,16 @@ fn atlas_build_reports_progress_and_can_be_cancelled() {
     .unwrap();
 
     let reports = reports.into_inner().unwrap();
-    // Two rasterize nodes, erosion and flow do atlas work.
-    assert!(reports.iter().all(|p| p.total == 4));
+    // Five rasterize nodes, strata, wind, moisture, erosion, flow, seasons
+    // and biome do atlas work.
+    assert!(reports.iter().all(|p| p.total == 12));
     let nodes: Vec<&str> = reports.iter().map(|p| p.node.as_str()).collect();
     for id in ["n4", "n5", "n6", "n7"] {
         assert!(nodes.contains(&id), "{id} reported progress");
     }
     assert!(reports
         .iter()
-        .any(|p| p.node == "n7" && p.fraction == 1.0 && p.index == 3));
+        .any(|p| p.node == "n20" && p.fraction == 1.0 && p.index == 11));
 
     // Cancel once erosion has started.
     let started = AtomicBool::new(false);
@@ -294,12 +296,12 @@ fn erosion_and_flow_are_deterministic_and_drain_to_the_sea() {
 
     // Rivers: discharge never decreases downstream, and each ends at the sea,
     // the atlas edge, or another river.
-    let rivers = &atlas.rivers()[0];
-    assert_eq!(rivers.0, "n7");
-    assert!(!rivers.1.is_empty());
+    let rivers = atlas.rivers()[0];
+    assert_eq!(rivers.node, "n7");
+    assert!(!rivers.paths.is_empty());
     let context = *atlas.context();
-    let ends: Vec<(f32, f32)> = rivers.1.iter().flat_map(|r| r.points.clone()).collect();
-    for river in &rivers.1 {
+    let ends: Vec<(f32, f32)> = rivers.paths.iter().flat_map(|r| r.points.clone()).collect();
+    for river in &rivers.paths {
         assert!(river.discharge.windows(2).all(|q| q[1] >= q[0]));
         let &(x, y) = river.points.last().unwrap();
         let (cx, cy) = context.cell_of(x.floor() as i64, y.floor() as i64);
@@ -405,7 +407,11 @@ fn timing_default_world() {
         ChunkSize::new(32, 32, 32).unwrap(),
         12345,
     );
-    let doc = steps::eroded_graph();
+    let mut doc = steps::eroded_graph();
+    if std::env::var("WG_PLAIN").is_ok() {
+        doc.edges
+            .retain(|e| !(e.to.node == "n6" && ["strata", "precipitation"].contains(&e.to.socket.as_str())));
+    }
     let last = std::sync::Mutex::new((String::new(), Instant::now()));
     let progress = |p: &AtlasProgress| {
         let mut last = last.lock().unwrap();
@@ -448,6 +454,178 @@ fn placeholder_worlds_build_without_running_atlas_nodes() {
     assert!(graph.analysis().nodes.iter().all(|n| n.reason.is_none()));
     let elevation = world.atlas().grid(slot_of(&graph, "n6.elevation")).unwrap();
     assert!(elevation.values().iter().all(|&v| v == 0.0));
-    assert!(world.atlas().rivers().is_empty());
+    assert!(world.atlas().rivers().iter().all(|r| r.paths.is_empty()));
     graph.validate(config, &world).unwrap();
+}
+
+/// Prints climate, biome, material and river statistics of the eroded
+/// template (calibration aid). Run with
+/// `cargo test --release --test atlas -- --ignored --nocapture diagnostics`.
+#[test]
+#[ignore]
+fn diagnostics_eroded_template() {
+    for (size, label) in [(2048u32, "test world"), (8192, "default world")] {
+        let half = i64::from(size / 2);
+        let config = PipelineConfig::new(
+            WorldBounds::new((-half, -half, 0), (size, size, 128)).unwrap(),
+            ChunkSize::new(32, 32, 32).unwrap(),
+            if size == 2048 { 99 } else { 12345 },
+        );
+        let doc = steps::eroded_graph();
+        let started = Instant::now();
+        let world = Arc::new(WorldStore::for_doc(&doc, &config).unwrap());
+        eprintln!("== {label}: built in {:?}", started.elapsed());
+        let graph = GraphPipeline::build(&doc, config, &world).unwrap();
+        for n in graph.analysis().nodes.iter().filter(|n| n.reason.is_some()) {
+            eprintln!("blocked {}: {:?}", n.id, n.reason);
+        }
+        let atlas = world.atlas();
+        let grid = |key: &str| atlas.grid(graph.schema().slot(key).unwrap()).unwrap();
+        let sea = world.sea_level();
+        let elevation = grid("n6.elevation").values();
+        let land: Vec<usize> = (0..elevation.len()).filter(|&i| elevation[i] >= sea).collect();
+        let pct = |key: &str| {
+            let v = grid(key).values();
+            let mut l: Vec<f32> = land.iter().map(|&i| v[i]).collect();
+            l.sort_by(|a, b| a.total_cmp(b));
+            let p = |q: f32| l[((l.len() - 1) as f32 * q) as usize];
+            eprintln!(
+                "{key}: p0 {:.0} p10 {:.0} p50 {:.0} p90 {:.0} p100 {:.0}",
+                p(0.0),
+                p(0.1),
+                p(0.5),
+                p(0.9),
+                p(1.0)
+            );
+        };
+        eprintln!("land fraction {:.2}", land.len() as f32 / elevation.len() as f32);
+        pct("n18.precipitation");
+        pct("n19.temperature");
+        pct("n7.discharge");
+        let histogram = |key: &str, names: &dyn Fn(u16) -> String| {
+            let v = grid(key).values();
+            let mut counts = std::collections::BTreeMap::new();
+            for &i in &land {
+                *counts.entry(v[i] as u16).or_insert(0usize) += 1;
+            }
+            let mut list: Vec<_> = counts.into_iter().collect();
+            list.sort_by(|a, b| b.1.cmp(&a.1));
+            let text: Vec<String> = list
+                .iter()
+                .map(|(id, n)| format!("{} {:.1}%", names(*id), *n as f32 * 100.0 / land.len() as f32))
+                .collect();
+            eprintln!("{key}: {}", text.join(", "));
+        };
+        let biomes = world.biomes().clone();
+        let materials = world.materials().clone();
+        histogram("n20.biome", &|id| biomes.get(id).unwrap().name.clone());
+        histogram("n6.surface_material", &|id| materials.get(id).unwrap().name.clone());
+        histogram("n16.surface_material", &|id| materials.get(id).unwrap().name.clone());
+        let rivers = atlas.rivers();
+        eprintln!(
+            "rivers: {} lines",
+            rivers.iter().map(|r| r.paths.len()).sum::<usize>()
+        );
+    }
+}
+
+/// Minimal PNG writer (stored deflate blocks) for diagnostic images.
+#[allow(dead_code)]
+fn write_png(path: &str, width: u32, height: u32, rgb: &[u8]) {
+    fn crc(bytes: &[u8]) -> u32 {
+        let mut c = 0xFFFF_FFFFu32;
+        for &b in bytes {
+            c ^= u32::from(b);
+            for _ in 0..8 {
+                c = if c & 1 == 1 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            }
+        }
+        !c
+    }
+    let mut raw = Vec::new();
+    for y in 0..height as usize {
+        raw.push(0u8);
+        raw.extend_from_slice(&rgb[y * width as usize * 3..(y + 1) * width as usize * 3]);
+    }
+    let mut z = vec![0x78, 0x01];
+    for (k, block) in raw.chunks(65535).enumerate() {
+        let last = (k + 1) * 65535 >= raw.len();
+        z.push(u8::from(last));
+        let len = block.len() as u16;
+        z.extend_from_slice(&len.to_le_bytes());
+        z.extend_from_slice(&(!len).to_le_bytes());
+        z.extend_from_slice(block);
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for &x in &raw {
+        a = (a + u32::from(x)) % 65521;
+        b = (b + a) % 65521;
+    }
+    z.extend_from_slice(&((b << 16) | a).to_be_bytes());
+    let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    let mut chunk = |kind: &[u8], data: &[u8]| {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let mut body = kind.to_vec();
+        body.extend_from_slice(data);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&crc(&body).to_be_bytes());
+    };
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    chunk(b"IHDR", &ihdr);
+    chunk(b"IDAT", &z);
+    chunk(b"IEND", &[]);
+    std::fs::write(path, out).unwrap();
+}
+
+/// Writes images of the default world's atlas grids to `WG_DUMP` (a folder).
+#[test]
+#[ignore]
+fn dump_eroded_template_images() {
+    let Ok(dir) = std::env::var("WG_DUMP") else { return };
+    let config = PipelineConfig::new(
+        WorldBounds::new((-4096, -4096, 0), (8192, 8192, 128)).unwrap(),
+        ChunkSize::new(32, 32, 32).unwrap(),
+        12345,
+    );
+    let doc = steps::eroded_graph();
+    let world = Arc::new(WorldStore::for_doc(&doc, &config).unwrap());
+    let graph = GraphPipeline::build(&doc, config, &world).unwrap();
+    let atlas = world.atlas();
+    let (w, h) = atlas.context().grid;
+    let sea = world.sea_level();
+    let elevation = atlas.grid(graph.schema().slot("n6.elevation").unwrap()).unwrap().values().to_vec();
+    let scalar = |key: &str, max: f32| {
+        let v = atlas.grid(graph.schema().slot(key).unwrap()).unwrap().values();
+        let rgb: Vec<u8> = v
+            .iter()
+            .zip(&elevation)
+            .flat_map(|(&x, &e)| {
+                let t = ((x / max).clamp(0.0, 1.0) * 255.0) as u8;
+                if e < sea { [t / 3, t / 3, 90 + t / 3] } else { [t, t, t] }
+            })
+            .collect();
+        write_png(&format!("{dir}/{}.png", key.replace('.', "_")), w, h, &rgb);
+    };
+    let hum = atlas.grid(graph.schema().slot("n18.humidity").unwrap()).unwrap();
+    let pre = atlas.grid(graph.schema().slot("n18.precipitation").unwrap()).unwrap();
+    let ras = atlas.grid(graph.schema().slot("n4.out").unwrap()).unwrap();
+    for row in [130u32, 200] {
+        let line: Vec<String> = (100..440)
+            .step_by(10)
+            .map(|x| format!("{:.0}/{:.2}/{:.0}", ras.get(x, row), hum.get(x, row), pre.get(x, row)))
+            .collect();
+        eprintln!("row {row}: {}", line.join(" "));
+    }
+    scalar("n6.elevation", 128.0);
+    scalar("n18.precipitation", 3000.0);
+    scalar("n18.humidity", 1.0);
+    scalar("n17.wind_u", 1.5);
+    scalar("n19.temperature", 30.0);
+    let biomes = world.biomes().clone();
+    let v = atlas.grid(graph.schema().slot("n20.biome").unwrap()).unwrap().values();
+    let rgb: Vec<u8> = v.iter().flat_map(|&b| biomes.get(b as u16).unwrap().color).collect();
+    write_png(&format!("{dir}/biome.png"), w, h, &rgb);
 }

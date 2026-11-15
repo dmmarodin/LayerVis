@@ -5,7 +5,7 @@
 	import ScriptEditor from '$lib/components/ScriptEditor.svelte';
 	import MenuBar from '$lib/components/MenuBar.svelte';
 	import { Visualizer, type HoverInfo, type VisualizerCallbacks } from '$lib/visualizer/visualizer';
-	import type { ViewMode } from '$lib/visualizer/fieldMaterial';
+	import { setPalettes, type ViewMode } from '$lib/visualizer/fieldMaterial';
 	import { MAX_VISIBLE_CHUNKS, type StreamStats } from '$lib/visualizer/streaming';
 	import type { OverlayStats } from '$lib/visualizer/overlay';
 	import {
@@ -73,11 +73,29 @@
 					.filter((n) => n.status === 'active' && n.order !== null && n.order <= selectedOrder)
 					.flatMap((n) => n.outputs.map((output) => `${n.id}.${output.name}`));
 	$: visualizer?.setStage(stageFields);
+	// Height slice (level slider on the map's right edge, as in slicers):
+	// ground above the level is cut away, lower ground fades into fog.
+	let sliceEnabled = false;
+	let sliceLevel = 64;
+	let fogDepth = 24;
+	$: depth = world?.dimensions[2] ?? 128;
+	$: seaLevel = depth * 0.3;
+	$: sliceLevel = Math.min(Math.max(0, Math.round(sliceLevel)), depth);
+	$: visualizer?.setSlice(sliceEnabled, sliceLevel, fogDepth);
+
+	function wheelLevel(event: WheelEvent) {
+		if (!sliceEnabled) return;
+		const stepBy = event.shiftKey ? 5 : 1;
+		sliceLevel = sliceLevel + (event.deltaY < 0 ? stepBy : -stepBy);
+	}
+
+	// Material and biome ids are colored from the world's tables.
+	$: if (world) setPalettes(world.materials, world.biomes);
 
 	function selectStep(id: string | null) {
 		selectedStep = id;
 		const node = graph?.nodes.find((n) => n.id === id);
-		const output = node?.outputs.find((o) => o.scope === 'column');
+		const output = node?.outputs.find((o) => o.scope === 'column' && o.kind === 'scalar');
 		// Show what the selected node produced.
 		if (node && output) {
 			focusField = { key: `${node.id}.${output.name}`, nonce: (focusField?.nonce ?? 0) + 1 };
@@ -466,6 +484,7 @@
 		onExtent={(extent) => editGraph(() => setExtent(extent))}
 		onSnapshot={(index) => visualizer?.setSnapshot(index)}
 		onRivers={(visible) => visualizer?.setRivers(visible)}
+		onGrid={(visible) => visualizer?.setGrid(visible)}
 		onGoTo={(x, y) => visualizer?.goTo(x, y)}
 		onFitWorld={() => visualizer?.fitWorld()}
 		getDataRange={() => visualizer?.dataRange() ?? null}
@@ -476,6 +495,50 @@
 			<button class="graph-toggle" on:click={() => (showGraph = !showGraph)}>
 				{showGraph ? 'Hide graph' : 'Show graph'}
 			</button>
+
+			{#if world}
+				<!-- Events stop here: the camera pans and zooms on the canvas container. -->
+				<!-- svelte-ignore a11y_no_static_element_interactions -->
+				<div
+					class="level-slider"
+					class:off={!sliceEnabled}
+					on:wheel|preventDefault|stopPropagation={wheelLevel}
+					on:mousedown|stopPropagation
+					on:dblclick|stopPropagation
+				>
+					<button
+						class="level-toggle"
+						class:on={sliceEnabled}
+						title="Height slice: cut the map at a level, fog below (wheel: ±1, Shift: ±5)"
+						on:click={() => (sliceEnabled = !sliceEnabled)}
+					>
+						Z
+					</button>
+					<span class="level-value mono" title="Level in cells (sea at {seaLevel.toFixed(1)})"
+						>{sliceLevel}</span
+					>
+					<div class="level-track">
+						<input
+							type="range"
+							min="0"
+							max={depth}
+							step="1"
+							bind:value={sliceLevel}
+							disabled={!sliceEnabled}
+							aria-label="Height level"
+						/>
+						<span
+							class="sea-mark"
+							style:bottom="{(seaLevel / Math.max(depth, 1)) * 100}%"
+							title="Sea level"
+						></span>
+					</div>
+					<label class="fog" title="Fog depth: how many cells below the level fade out">
+						<span>fog</span>
+						<input type="number" min="1" max="256" bind:value={fogDepth} disabled={!sliceEnabled} />
+					</label>
+				</div>
+			{/if}
 
 			{#if world?.atlas.pending}
 				<div class="atlas-banner">
@@ -597,6 +660,103 @@
 	.stage-banner .muted,
 	.atlas-banner .muted {
 		color: #8a8fa6;
+	}
+
+	.level-slider {
+		position: absolute;
+		box-sizing: border-box;
+		overflow: hidden;
+		right: 10px;
+		top: 50%;
+		transform: translateY(-50%);
+		height: min(60%, 420px);
+		z-index: 1;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 6px;
+		padding: 6px 4px;
+		border-radius: 8px;
+		border: 1px solid #3a3f52;
+		background: #1b1d25e0;
+		color: #c3cbe8;
+		font-size: 11px;
+	}
+
+	.level-slider.off .level-track,
+	.level-slider.off .fog,
+	.level-slider.off .level-value {
+		opacity: 0.45;
+	}
+
+	.level-toggle {
+		width: 26px;
+		height: 22px;
+		padding: 0;
+		border-radius: 4px;
+		border: 1px solid #3a3f52;
+		background: #262a36;
+		color: #8a8fa6;
+		font-weight: 600;
+		cursor: pointer;
+	}
+
+	.level-toggle.on {
+		border-color: #6fa8ff;
+		background: #233552;
+		color: #e6ecff;
+	}
+
+	.level-value {
+		min-width: 26px;
+		text-align: center;
+	}
+
+	.level-track {
+		position: relative;
+		flex: 1 1 0;
+		min-height: 0;
+		width: 18px;
+	}
+
+	/* Absolutely sized so the input's own (horizontal) length never
+	   stretches the panel. */
+	.level-track input[type='range'] {
+		position: absolute;
+		inset: 0;
+		writing-mode: vertical-lr;
+		direction: rtl;
+		width: 100%;
+		height: 100%;
+		min-height: 0;
+		margin: 0;
+		accent-color: #6fa8ff;
+		cursor: pointer;
+	}
+
+	.sea-mark {
+		position: absolute;
+		left: -4px;
+		right: -4px;
+		height: 2px;
+		margin-bottom: -1px;
+		background: #3d7fd9;
+		pointer-events: none;
+	}
+
+	.fog {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 2px;
+		color: #8a8fa6;
+	}
+
+	.fog input {
+		width: 34px;
+		font-size: 11px;
+		text-align: center;
+		padding: 1px 2px;
 	}
 
 	.atlas-banner {

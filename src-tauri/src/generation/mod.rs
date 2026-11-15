@@ -19,7 +19,7 @@ use cache::{CacheKey, PayloadCache};
 use layergen::{ChunkCoord, ChunkSize, PipelineConfig, WorldBounds};
 use serde::Serialize;
 use worldgraph::{
-    can_connect, creates_cycle, graph::id_order, pipeline::SCRIPT_KIND, resolve, steps,
+    can_connect, creates_cycle, SocketType, graph::id_order, pipeline::SCRIPT_KIND, resolve, steps,
     world_signature, ColumnData, EdgeDoc, Export, Extent, FieldDef, FieldScope, FrameDoc, GraphDoc,
     GraphPipeline, NodeDoc, NodeReport, NodeStatus, RiverPath, SocketRef, Voxel, WorldStats,
 };
@@ -67,6 +67,22 @@ pub struct WorldInfo {
     /// overview samples are stale then.
     pub world_generation: u64,
     pub atlas: AtlasInfo,
+    /// The world's material ids (index = id): colors and names for the
+    /// `material` ramp, legends and the cursor readout.
+    pub materials: Vec<PaletteEntry>,
+    /// The world's biome ids (index = id), for the `biome` ramp.
+    pub biomes: Vec<PaletteEntry>,
+}
+
+/// One id of a categorical table (material or biome).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaletteEntry {
+    pub name: String,
+    pub label: String,
+    pub color: [u8; 3],
+    /// Material category or biome glyph.
+    pub detail: String,
 }
 
 /// The atlas of the published world.
@@ -417,9 +433,9 @@ impl Session {
             .atlas()
             .rivers()
             .iter()
-            .map(|(node, rivers)| RiverSet {
-                node: node.clone(),
-                rivers: rivers.clone(),
+            .map(|network| RiverSet {
+                node: network.node.clone(),
+                rivers: network.paths.clone(),
             })
             .collect())
     }
@@ -501,6 +517,30 @@ impl Session {
             exports: active.pipeline.exports().to_vec(),
             world_stats: active.stats,
             world_generation: active.world_generation,
+            materials: active
+                .world
+                .materials()
+                .defs()
+                .iter()
+                .map(|m| PaletteEntry {
+                    name: m.name.clone(),
+                    label: m.name.replace('_', " "),
+                    color: m.color,
+                    detail: format!("{:?}", m.category).to_lowercase(),
+                })
+                .collect(),
+            biomes: active
+                .world
+                .biomes()
+                .defs()
+                .iter()
+                .map(|b| PaletteEntry {
+                    name: b.name.clone(),
+                    label: b.label.clone(),
+                    color: b.color,
+                    detail: b.glyph.clone(),
+                })
+                .collect(),
             atlas: {
                 let atlas = active.world.atlas();
                 AtlasInfo {
@@ -611,7 +651,7 @@ impl Session {
 
             if let Ok(contract) = resolve(&node).contract {
                 for input in &contract.inputs {
-                    if let Some(from) = latest_output(&active, &input.name, input.scope) {
+                    if let Some(from) = latest_output(&active, &input.name, SocketType::new(input.scope, input.kind)) {
                         doc.edges.push(EdgeDoc {
                             from,
                             to: SocketRef {
@@ -837,7 +877,7 @@ impl Session {
     pub fn connect(&self, from: SocketRef, to: SocketRef) -> Result<PipelineGraph, String> {
         self.edit(|doc| {
             let socket_scope =
-                |node: &str, socket: &str, output: bool| -> Result<FieldScope, String> {
+                |node: &str, socket: &str, output: bool| -> Result<SocketType, String> {
                     let node_doc = doc
                         .node(node)
                         .ok_or_else(|| format!("Node `{node}` does not exist"))?;
@@ -847,13 +887,13 @@ impl Session {
                             .outputs
                             .iter()
                             .find(|o| o.name == socket)
-                            .map(|o| o.scope)
+                            .map(|o| o.socket_type())
                     } else {
                         contract
                             .inputs
                             .iter()
                             .find(|i| i.name == socket)
-                            .map(|i| i.scope)
+                            .map(|i| i.socket_type())
                     };
                     scope.ok_or_else(|| {
                         let side = if output { "output" } else { "input" };
@@ -1183,7 +1223,7 @@ fn clamp_frame_size((width, height): (f64, f64)) -> (f64, f64) {
 
 /// Latest-ordered active output with this name and type (for auto-connect),
 /// falling back to any node declaring it.
-fn latest_output(active: &Active, name: &str, scope: FieldScope) -> Option<SocketRef> {
+fn latest_output(active: &Active, name: &str, scope: SocketType) -> Option<SocketRef> {
     let mut candidates: Vec<(Option<usize>, &NodeReport)> = active
         .pipeline
         .analysis()
@@ -1192,7 +1232,7 @@ fn latest_output(active: &Active, name: &str, scope: FieldScope) -> Option<Socke
         .filter(|node| {
             node.outputs
                 .iter()
-                .any(|o| o.name == name && can_connect(o.scope, scope))
+                .any(|o| o.name == name && can_connect(SocketType::new(o.scope, o.kind), scope))
         })
         .map(|node| {
             (

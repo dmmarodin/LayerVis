@@ -2,6 +2,18 @@ import { invoke } from '@tauri-apps/api/core';
 
 export type FieldScope = 'voxel' | 'column' | 'world' | 'atlas';
 
+/** What a socket carries, orthogonal to its scope (mirrors `ValueKind`). */
+export type ValueKind = 'scalar' | 'material' | 'strata' | 'rivers';
+
+/** One id of a categorical table (material or biome); index = id. */
+export interface PaletteEntry {
+	name: string;
+	label: string;
+	color: [number, number, number];
+	/** Material category or biome glyph. */
+	detail: string;
+}
+
 export interface FieldDef {
 	/** Unique id: `node.socket` for node outputs, the name for world fields. */
 	key: string;
@@ -11,6 +23,7 @@ export interface FieldDef {
 	/** Socket name. */
 	name: string;
 	scope: FieldScope;
+	kind: ValueKind;
 	slot: number;
 	unit: string;
 	min: number;
@@ -28,6 +41,10 @@ export interface WorldInfo {
 	revision: number;
 	/** Changes when the world stage is rebuilt (seed or world nodes). */
 	worldGeneration: number;
+	/** The world's material ids (index = id). */
+	materials: PaletteEntry[];
+	/** The world's biome ids (index = id). */
+	biomes: PaletteEntry[];
 	/** Order matches the field planes in chunk payloads. */
 	columnFields: FieldDef[];
 	voxelFields: FieldDef[];
@@ -103,9 +120,22 @@ export type NodeStatus = 'active' | 'disabled' | 'blocked';
  */
 export type SocketScope = 'atlas' | 'world' | 'column' | 'voxel';
 
+/** A socket's full type. */
+export interface SocketType {
+	scope: SocketScope;
+	kind: ValueKind;
+}
+
+export interface SocketInfo extends SocketType {
+	name: string;
+	/** Inputs only: may stay unconnected. */
+	optional: boolean;
+}
+
 /** Can an output of type `from` be wired into an input of type `to`? (Mirrors `can_connect`.) */
-export const canConnect = (from: SocketScope, to: SocketScope) =>
-	from === to || (from === 'world' && to === 'column');
+export const canConnect = (from: SocketType, to: SocketType) =>
+	from.kind === to.kind &&
+	(from.scope === to.scope || (from.scope === 'world' && to.scope === 'column'));
 // Atlas sockets connect only to atlas sockets (Rasterize / Sample adapt).
 
 export interface SocketRef {
@@ -137,8 +167,8 @@ export interface NodeReport {
 	reason: string | null;
 	/** Execution position for active nodes. */
 	order: number | null;
-	inputs: Array<{ name: string; scope: SocketScope }>;
-	outputs: Array<{ name: string; scope: SocketScope }>;
+	inputs: SocketInfo[];
+	outputs: SocketInfo[];
 	params: ParamReport[];
 	/** Rhai script node (editable source). */
 	script: boolean;
@@ -154,6 +184,7 @@ export interface EdgeReport {
 	from: SocketRef;
 	to: SocketRef;
 	scope: SocketScope | null;
+	kind: ValueKind | null;
 	/** False for dangling or mistyped edges kept from a saved file. */
 	valid: boolean;
 }
@@ -164,6 +195,8 @@ export interface Export {
 	/** Export node id. */
 	node: string;
 	scope: SocketScope;
+	/** `material` exports index `Voxel::materials`, scalar ones the f32 slots. */
+	kind: ValueKind;
 	slot: number;
 	/** Key (`node.socket`) of the exported field. */
 	field: string;

@@ -18,8 +18,11 @@ use std::{
 use serde::Serialize;
 
 use crate::{
+    biomes::BiomeTable,
+    materials::MaterialTable,
     pipeline::{Build, FieldSpec, InputSpec, NodeKind, ParamSpec, WorldStep},
-    FieldScope, WORLD_SLOTS,
+    strata::{StrataGrid, STRATA_LAYERS},
+    FieldScope, ValueKind, WORLD_SLOTS,
 };
 
 /// Atlas cell size (columns per side) when a graph does not set one.
@@ -108,6 +111,34 @@ impl AtlasGrid {
 
     pub fn values_mut(&mut self) -> &mut [f32] {
         &mut self.values
+    }
+
+    /// Value at continuous cell coordinates with Catmull-Rom (bicubic)
+    /// interpolation: smooth across cell borders, unlike `bilinear`, so
+    /// sampled terrain shows no facets at the cell grid. Clamped to the grid.
+    pub fn bicubic(&self, u: f64, v: f64) -> f32 {
+        let max_x = f64::from(self.width - 1);
+        let max_y = f64::from(self.height - 1);
+        let (u, v) = (u.clamp(0.0, max_x), v.clamp(0.0, max_y));
+        let (x0, y0) = (u.floor(), v.floor());
+        let (tx, ty) = (u - x0, v - y0);
+        let (x0, y0) = (x0 as i64, y0 as i64);
+        let at = |x: i64, y: i64| {
+            let x = x.clamp(0, i64::from(self.width) - 1) as u32;
+            let y = y.clamp(0, i64::from(self.height) - 1) as u32;
+            f64::from(self.get(x, y))
+        };
+        let cubic = |p0: f64, p1: f64, p2: f64, p3: f64, t: f64| {
+            p1 + 0.5
+                * t
+                * (p2 - p0 + t * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3 + t * (3.0 * (p1 - p2) + p3 - p0)))
+        };
+        let mut rows = [0.0; 4];
+        for (k, row) in rows.iter_mut().enumerate() {
+            let y = y0 - 1 + k as i64;
+            *row = cubic(at(x0 - 1, y), at(x0, y), at(x0 + 1, y), at(x0 + 2, y), tx);
+        }
+        cubic(rows[0], rows[1], rows[2], rows[3], ty) as f32
     }
 
     /// Value at continuous cell coordinates (cell centers at integer + 0),
@@ -248,12 +279,158 @@ impl AtlasContext {
 // Vector features
 
 /// One river line: points in world columns from source to mouth, with the
-/// discharge (accumulated drainage, in cells) at each point.
+/// discharge (accumulated drainage, in cells) and the water surface
+/// elevation (cells) at each point.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RiverPath {
     pub points: Vec<(f32, f32)>,
     pub discharge: Vec<f32>,
+    pub level: Vec<f32>,
+}
+
+/// The nearest river to a point (see `RiverNetwork::nearest`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RiverHit {
+    /// Distance in columns from the point to the river line.
+    pub distance: f32,
+    /// Discharge and water level interpolated at the nearest point.
+    pub discharge: f32,
+    pub level: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Segment {
+    a: (f32, f32),
+    b: (f32, f32),
+    discharge: (f32, f32),
+    level: (f32, f32),
+}
+
+/// River lines of one node plus a spatial index of their segments, bucketed
+/// per atlas cell, so chunk and world nodes can find the nearest river fast.
+#[derive(Clone, Debug)]
+pub struct RiverNetwork {
+    /// Id of the node that traced the rivers.
+    pub node: String,
+    pub paths: Vec<RiverPath>,
+    segments: Vec<Segment>,
+    /// CSR buckets: segments overlapping cell `c` are
+    /// `items[start[c]..start[c + 1]]`.
+    start: Vec<u32>,
+    items: Vec<u32>,
+    context: AtlasContext,
+}
+
+impl PartialEq for RiverNetwork {
+    fn eq(&self, other: &Self) -> bool {
+        self.node == other.node && self.paths == other.paths
+    }
+}
+
+impl RiverNetwork {
+    pub fn new(node: impl Into<String>, paths: Vec<RiverPath>, context: AtlasContext) -> Self {
+        let mut segments = Vec::new();
+        for path in &paths {
+            for k in 1..path.points.len() {
+                segments.push(Segment {
+                    a: path.points[k - 1],
+                    b: path.points[k],
+                    discharge: (path.discharge[k - 1], path.discharge[k]),
+                    level: (path.level[k - 1], path.level[k]),
+                });
+            }
+        }
+
+        let (gw, gh) = (context.grid.0 as usize, context.grid.1 as usize);
+        let cells = gw * gh;
+        let cell_range = |s: &Segment| {
+            let (x0, x1) = (s.a.0.min(s.b.0) as i64, s.a.0.max(s.b.0) as i64);
+            let (y0, y1) = (s.a.1.min(s.b.1) as i64, s.a.1.max(s.b.1) as i64);
+            let (cx0, cy0) = context.cell_of(x0, y0);
+            let (cx1, cy1) = context.cell_of(x1, y1);
+            (cx0, cy0, cx1, cy1)
+        };
+        let mut counts = vec![0u32; cells + 1];
+        for s in &segments {
+            let (cx0, cy0, cx1, cy1) = cell_range(s);
+            for cy in cy0..=cy1 {
+                for cx in cx0..=cx1 {
+                    counts[cx as usize + cy as usize * gw] += 1;
+                }
+            }
+        }
+        let mut start = vec![0u32; cells + 1];
+        for c in 0..cells {
+            start[c + 1] = start[c] + counts[c];
+        }
+        let mut fill = start.clone();
+        let mut items = vec![0u32; start[cells] as usize];
+        for (id, s) in segments.iter().enumerate() {
+            let (cx0, cy0, cx1, cy1) = cell_range(s);
+            for cy in cy0..=cy1 {
+                for cx in cx0..=cx1 {
+                    let c = cx as usize + cy as usize * gw;
+                    items[fill[c] as usize] = id as u32;
+                    fill[c] += 1;
+                }
+            }
+        }
+
+        Self {
+            node: node.into(),
+            paths,
+            segments,
+            start,
+            items,
+            context,
+        }
+    }
+
+    /// No rivers (placeholder worlds).
+    pub fn empty(context: AtlasContext) -> Self {
+        Self::new(String::new(), Vec::new(), context)
+    }
+
+    /// The nearest river line within `radius` columns of `(x, y)`.
+    pub fn nearest(&self, x: f64, y: f64, radius: f64) -> Option<RiverHit> {
+        if self.segments.is_empty() {
+            return None;
+        }
+        let c = &self.context;
+        let (cx0, cy0) = c.cell_of((x - radius).floor() as i64, (y - radius).floor() as i64);
+        let (cx1, cy1) = c.cell_of((x + radius).ceil() as i64, (y + radius).ceil() as i64);
+        let gw = c.grid.0 as usize;
+        let mut best: Option<RiverHit> = None;
+        let (px, py) = (x as f32, y as f32);
+
+        for cy in cy0..=cy1 {
+            for cx in cx0..=cx1 {
+                let cell = cx as usize + cy as usize * gw;
+                for &id in &self.items[self.start[cell] as usize..self.start[cell + 1] as usize] {
+                    let s = &self.segments[id as usize];
+                    let (dx, dy) = (s.b.0 - s.a.0, s.b.1 - s.a.1);
+                    let len2 = dx * dx + dy * dy;
+                    let t = if len2 > 0.0 {
+                        (((px - s.a.0) * dx + (py - s.a.1) * dy) / len2).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let (qx, qy) = (s.a.0 + dx * t, s.a.1 + dy * t);
+                    let distance = ((px - qx).powi(2) + (py - qy).powi(2)).sqrt();
+                    if distance <= radius as f32 && best.is_none_or(|b| distance < b.distance) {
+                        best = Some(RiverHit {
+                            distance,
+                            discharge: s.discharge.0 + (s.discharge.1 - s.discharge.0) * t,
+                            level: s.level.0 + (s.level.1 - s.level.0) * t,
+                        });
+                    }
+                }
+            }
+        }
+
+        best
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -266,42 +443,92 @@ pub trait AtlasStage: Send + Sync + 'static {
 
 pub type BoxedAtlasStage = Box<dyn AtlasStage>;
 
-/// What an atlas stage reads and writes: input grids by slot (finished
-/// earlier in graph order), and its own outputs.
+/// What an atlas stage reads and writes: inputs by slot (finished earlier in
+/// graph order), and its own outputs.
 pub struct AtlasIo<'a> {
-    context: &'a AtlasContext,
-    grids: &'a [Option<Arc<AtlasGrid>>],
+    atlas: &'a Atlas,
     written: Vec<(usize, AtlasGrid)>,
-    rivers: Option<Vec<RiverPath>>,
+    strata: Vec<(usize, StrataGrid)>,
+    rivers: Vec<(usize, Vec<RiverPath>)>,
+}
+
+/// What one atlas stage produced.
+pub(crate) struct AtlasOutputs {
+    pub grids: Vec<(usize, AtlasGrid)>,
+    pub strata: Vec<(usize, StrataGrid)>,
+    pub rivers: Vec<(usize, Vec<RiverPath>)>,
 }
 
 impl<'a> AtlasIo<'a> {
-    pub(crate) fn new(context: &'a AtlasContext, grids: &'a [Option<Arc<AtlasGrid>>]) -> Self {
+    pub(crate) fn new(atlas: &'a Atlas) -> Self {
         Self {
-            context,
-            grids,
+            atlas,
             written: Vec::new(),
-            rivers: None,
+            strata: Vec::new(),
+            rivers: Vec::new(),
         }
     }
 
     pub fn context(&self) -> &AtlasContext {
-        self.context
+        &self.atlas.context
+    }
+
+    /// The world's material table (ids in strata and material grids).
+    pub fn materials(&self) -> &MaterialTable {
+        &self.atlas.materials
+    }
+
+    /// The world's biome table (ids in biome grids).
+    pub fn biomes(&self) -> &BiomeTable {
+        &self.atlas.biomes
     }
 
     pub fn input(&self, slot: usize) -> Result<&AtlasGrid, String> {
-        self.grids
-            .get(slot)
-            .and_then(Option::as_deref)
+        self.atlas
+            .grid(slot)
             .ok_or_else(|| format!("atlas input slot {slot} has no grid"))
+    }
+
+    /// An optional scalar input: None when the slot is None.
+    pub fn optional(&self, slot: Option<usize>) -> Result<Option<&AtlasGrid>, String> {
+        slot.map(|slot| self.input(slot)).transpose()
+    }
+
+    pub fn strata_input(&self, slot: usize) -> Result<&StrataGrid, String> {
+        self.atlas
+            .strata(slot)
+            .ok_or_else(|| format!("atlas strata slot {slot} has no strata"))
+    }
+
+    pub fn rivers_input(&self, slot: usize) -> Result<&RiverNetwork, String> {
+        self.atlas
+            .river_network(slot)
+            .ok_or_else(|| format!("atlas rivers slot {slot} has no rivers"))
+    }
+
+    /// Stores strata (must be the atlas size).
+    pub fn write_strata(&mut self, slot: usize, strata: StrataGrid) -> Result<(), String> {
+        if (strata.width(), strata.height()) != self.atlas.context.grid {
+            return Err("strata grid does not match the atlas size".to_owned());
+        }
+        self.strata.retain(|(s, _)| *s != slot);
+        self.strata.push((slot, strata));
+        Ok(())
+    }
+
+    /// Stores river lines (indexed for nearest-river queries when stored).
+    pub fn write_rivers(&mut self, slot: usize, rivers: Vec<RiverPath>) {
+        self.rivers.retain(|(s, _)| *s != slot);
+        self.rivers.push((slot, rivers));
     }
 
     /// Stores an output grid (must be the atlas size).
     pub fn write(&mut self, slot: usize, grid: AtlasGrid) -> Result<(), String> {
-        if (grid.width, grid.height) != self.context.grid {
+        let context = self.atlas.context;
+        if (grid.width, grid.height) != context.grid {
             return Err(format!(
                 "output grid is {}x{}, the atlas is {}x{}",
-                grid.width, grid.height, self.context.grid.0, self.context.grid.1
+                grid.width, grid.height, context.grid.0, context.grid.1
             ));
         }
         self.written.retain(|(s, _)| *s != slot);
@@ -309,13 +536,18 @@ impl<'a> AtlasIo<'a> {
         Ok(())
     }
 
-    /// River lines this node produced (kept on the atlas under the node id).
-    pub fn set_rivers(&mut self, rivers: Vec<RiverPath>) {
-        self.rivers = Some(rivers);
+    /// Stores a grid from values (row-major, the atlas size).
+    pub fn write_values(&mut self, slot: usize, values: Vec<f32>) -> Result<(), String> {
+        let (w, h) = self.atlas.context.grid;
+        self.write(slot, AtlasGrid::from_values(w, h, values)?)
     }
 
-    pub(crate) fn finish(self) -> (Vec<(usize, AtlasGrid)>, Option<Vec<RiverPath>>) {
-        (self.written, self.rivers)
+    pub(crate) fn finish(self) -> AtlasOutputs {
+        AtlasOutputs {
+            grids: self.written,
+            strata: self.strata,
+            rivers: self.rivers,
+        }
     }
 }
 
@@ -424,30 +656,40 @@ impl<'a> AtlasRun<'a> {
 // ---------------------------------------------------------------------------
 // The finished atlas
 
-/// Every atlas grid of one world, by atlas slot, plus vector features and
-/// scrubber snapshots.
+/// Every atlas value of one world by atlas slot (scalar grids, strata and
+/// river networks each have their own slot space), the world's material and
+/// biome id tables, and scrubber snapshots.
 #[derive(Clone, Debug)]
 pub struct Atlas {
     context: AtlasContext,
     pub(crate) grids: Vec<Option<Arc<AtlasGrid>>>,
-    pub(crate) rivers: Vec<(String, Vec<RiverPath>)>,
+    pub(crate) strata: Vec<Option<Arc<StrataGrid>>>,
+    pub(crate) rivers: Vec<Option<Arc<RiverNetwork>>>,
     pub(crate) snapshots: Vec<AtlasSnapshot>,
     /// `world_signature` of the graph the atlas was built from.
     pub(crate) signature: String,
+    /// Material ids in this world (strata, material grids, voxels).
+    pub(crate) materials: Arc<MaterialTable>,
+    /// Biome ids in this world (biome grids).
+    pub(crate) biomes: Arc<BiomeTable>,
 }
 
 /// Magic and version of `Atlas::write`.
 const ATLAS_MAGIC: &[u8; 8] = b"WGATLAS\0";
-const ATLAS_VERSION: u32 = 1;
+/// 2: material and biome id tables, strata, river levels, rivers by slot.
+pub const ATLAS_VERSION: u32 = 2;
 
 impl Atlas {
     pub(crate) fn empty(context: AtlasContext) -> Self {
         Self {
             context,
             grids: Vec::new(),
+            strata: Vec::new(),
             rivers: Vec::new(),
             snapshots: Vec::new(),
             signature: String::new(),
+            materials: MaterialTable::builtin(),
+            biomes: BiomeTable::builtin(),
         }
     }
 
@@ -464,9 +706,27 @@ impl Atlas {
         self.grids.len()
     }
 
-    /// River lines per producing node id.
-    pub fn rivers(&self) -> &[(String, Vec<RiverPath>)] {
-        &self.rivers
+    /// The strata in a strata slot.
+    pub fn strata(&self, slot: usize) -> Option<&StrataGrid> {
+        self.strata.get(slot).and_then(Option::as_deref)
+    }
+
+    /// The river network in a rivers slot.
+    pub fn river_network(&self, slot: usize) -> Option<&RiverNetwork> {
+        self.rivers.get(slot).and_then(Option::as_deref)
+    }
+
+    /// Every river network (one per node with a `rivers` output).
+    pub fn rivers(&self) -> Vec<&RiverNetwork> {
+        self.rivers.iter().flatten().map(Arc::as_ref).collect()
+    }
+
+    pub fn materials(&self) -> &Arc<MaterialTable> {
+        &self.materials
+    }
+
+    pub fn biomes(&self) -> &Arc<BiomeTable> {
+        &self.biomes
     }
 
     pub fn snapshots(&self) -> &[AtlasSnapshot] {
@@ -477,8 +737,8 @@ impl Atlas {
         &self.signature
     }
 
-    /// Saves grids and rivers (not snapshots) in a versioned little-endian
-    /// binary format, for a game's world file.
+    /// Saves grids, strata, rivers and the id tables (not snapshots) in a
+    /// versioned little-endian binary format, for a game's world file.
     pub fn write(&self, out: &mut impl Write) -> std::io::Result<()> {
         let c = &self.context;
         out.write_all(ATLAS_MAGIC)?;
@@ -490,6 +750,12 @@ impl Atlas {
             out.write_all(&value.to_le_bytes())?;
         }
         write_str(out, &self.signature)?;
+        for names in [self.materials.names(), self.biomes.names()] {
+            out.write_all(&(names.len() as u32).to_le_bytes())?;
+            for name in names {
+                write_str(out, name)?;
+            }
+        }
 
         out.write_all(&(self.grids.len() as u32).to_le_bytes())?;
         for grid in &self.grids {
@@ -504,14 +770,36 @@ impl Atlas {
             }
         }
 
+        out.write_all(&(self.strata.len() as u32).to_le_bytes())?;
+        for strata in &self.strata {
+            match strata {
+                None => out.write_all(&[0])?,
+                Some(strata) => {
+                    out.write_all(&[1])?;
+                    for &material in strata.materials() {
+                        out.write_all(&material.to_le_bytes())?;
+                    }
+                    for &top in strata.tops() {
+                        out.write_all(&top.to_le_bytes())?;
+                    }
+                }
+            }
+        }
+
         out.write_all(&(self.rivers.len() as u32).to_le_bytes())?;
-        for (node, paths) in &self.rivers {
-            write_str(out, node)?;
-            out.write_all(&(paths.len() as u32).to_le_bytes())?;
-            for path in paths {
+        for network in &self.rivers {
+            let Some(network) = network else {
+                out.write_all(&[0])?;
+                continue;
+            };
+            out.write_all(&[1])?;
+            write_str(out, &network.node)?;
+            out.write_all(&(network.paths.len() as u32).to_le_bytes())?;
+            for path in &network.paths {
                 out.write_all(&(path.points.len() as u32).to_le_bytes())?;
-                for (&(x, y), &discharge) in path.points.iter().zip(&path.discharge) {
-                    for value in [x, y, discharge] {
+                for k in 0..path.points.len() {
+                    let (x, y) = path.points[k];
+                    for value in [x, y, path.discharge[k], path.level[k]] {
                         out.write_all(&value.to_le_bytes())?;
                     }
                 }
@@ -548,6 +836,16 @@ impl Atlas {
             return Err("atlas grid size does not match its world size".to_owned());
         }
         let signature = reader.string()?;
+        let mut tables = Vec::new();
+        for _ in 0..2 {
+            let count = reader.count(1 << 16)?;
+            let names = (0..count)
+                .map(|_| reader.string())
+                .collect::<Result<Vec<_>, _>>()?;
+            tables.push(names);
+        }
+        let materials = Arc::new(MaterialTable::from_names(&tables[0]));
+        let biomes = Arc::new(BiomeTable::from_names(&tables[1]));
 
         let cells = grid.0 as usize * grid.1 as usize;
         let grid_count = reader.count(ATLAS_SLOTS)?;
@@ -567,9 +865,37 @@ impl Atlas {
             });
         }
 
-        let river_sets = reader.count(1 << 16)?;
+        let strata_count = reader.count(ATLAS_SLOTS)?;
+        let mut strata = Vec::with_capacity(strata_count);
+        for _ in 0..strata_count {
+            let mut flag = [0u8; 1];
+            reader.bytes(&mut flag)?;
+            strata.push(match flag[0] {
+                0 => None,
+                1 => {
+                    let materials = (0..cells * STRATA_LAYERS)
+                        .map(|_| reader.u16())
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let tops = (0..cells * STRATA_LAYERS)
+                        .map(|_| reader.f32())
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Some(Arc::new(StrataGrid::from_parts(
+                        grid.0, grid.1, materials, tops,
+                    )?))
+                }
+                other => return Err(format!("bad strata flag {other}")),
+            });
+        }
+
+        let river_sets = reader.count(ATLAS_SLOTS)?;
         let mut rivers = Vec::with_capacity(river_sets);
         for _ in 0..river_sets {
+            let mut flag = [0u8; 1];
+            reader.bytes(&mut flag)?;
+            if flag[0] == 0 {
+                rivers.push(None);
+                continue;
+            }
             let node = reader.string()?;
             let paths = reader.count(1 << 24)?;
             let mut set = Vec::with_capacity(paths.min(1 << 16));
@@ -578,22 +904,27 @@ impl Atlas {
                 let mut path = RiverPath {
                     points: Vec::with_capacity(points.min(1 << 16)),
                     discharge: Vec::with_capacity(points.min(1 << 16)),
+                    level: Vec::with_capacity(points.min(1 << 16)),
                 };
                 for _ in 0..points {
                     path.points.push((reader.f32()?, reader.f32()?));
                     path.discharge.push(reader.f32()?);
+                    path.level.push(reader.f32()?);
                 }
                 set.push(path);
             }
-            rivers.push((node, set));
+            rivers.push(Some(Arc::new(RiverNetwork::new(node, set, context))));
         }
 
         Ok(Self {
             context,
             grids,
+            strata,
             rivers,
             snapshots: Vec::new(),
             signature,
+            materials,
+            biomes,
         })
     }
 }
@@ -610,6 +941,12 @@ impl<R: Read> Reader<'_, R> {
         self.0
             .read_exact(buf)
             .map_err(|e| format!("truncated atlas: {e}"))
+    }
+
+    fn u16(&mut self) -> Result<u16, String> {
+        let mut b = [0u8; 2];
+        self.bytes(&mut b)?;
+        Ok(u16::from_le_bytes(b))
     }
 
     fn u32(&mut self) -> Result<u32, String> {
@@ -664,10 +1001,13 @@ pub static RASTERIZE: NodeKind = NodeKind {
     inputs: &[InputSpec {
         name: Cow::Borrowed("in"),
         scope: FieldScope::World,
+        kind: ValueKind::Scalar,
+        optional: false,
     }],
     outputs: &[FieldSpec {
         name: Cow::Borrowed("out"),
         scope: FieldScope::Atlas,
+        kind: ValueKind::Scalar,
         unit: Cow::Borrowed(""),
         min: 0.0,
         max: 1.0,
@@ -688,14 +1028,19 @@ pub static SAMPLE: NodeKind = NodeKind {
     id: "sample",
     label: "Sample (atlas → world)",
     description: "Reads an atlas grid at any world point, so world and chunk \
-                  nodes can use it. `mode` 0 = nearest cell, 1 = bilinear.",
+                  nodes can use it. `mode` 0 = nearest cell (for categories such as \
+                  biomes or materials), 1 = bilinear, 2 = bicubic (smooth, no facets \
+                  at cell borders).",
     inputs: &[InputSpec {
         name: Cow::Borrowed("in"),
         scope: FieldScope::Atlas,
+        kind: ValueKind::Scalar,
+        optional: false,
     }],
     outputs: &[FieldSpec {
         name: Cow::Borrowed("out"),
         scope: FieldScope::World,
+        kind: ValueKind::Scalar,
         unit: Cow::Borrowed(""),
         min: 0.0,
         max: 1.0,
@@ -706,7 +1051,7 @@ pub static SAMPLE: NodeKind = NodeKind {
         name: "mode",
         default: 1.0,
         min: 0.0,
-        max: 1.0,
+        max: 2.0,
     }],
     build: Build::Sample,
 };
@@ -719,10 +1064,13 @@ pub static REROUTE_ATLAS: NodeKind = NodeKind {
     inputs: &[InputSpec {
         name: Cow::Borrowed("in"),
         scope: FieldScope::Atlas,
+        kind: ValueKind::Scalar,
+        optional: false,
     }],
     outputs: &[FieldSpec {
         name: Cow::Borrowed("out"),
         scope: FieldScope::Atlas,
+        kind: ValueKind::Scalar,
         unit: Cow::Borrowed(""),
         min: 0.0,
         max: 1.0,
@@ -738,17 +1086,25 @@ pub(crate) struct SampleStep {
     pub grid: Arc<AtlasGrid>,
     pub context: AtlasContext,
     pub out: usize,
-    pub bilinear: bool,
+    /// 0 nearest, 1 bilinear, 2 bicubic.
+    pub mode: u8,
 }
 
 impl WorldStep for SampleStep {
     fn run(&self, x: i64, y: i64, slots: &mut [f64; WORLD_SLOTS]) {
-        slots[self.out] = if self.bilinear {
-            let (u, v) = self.context.cell_coords(x, y);
-            f64::from(self.grid.bilinear(u, v))
-        } else {
-            let (cx, cy) = self.context.cell_of(x, y);
-            f64::from(self.grid.get(cx, cy))
+        slots[self.out] = match self.mode {
+            0 => {
+                let (cx, cy) = self.context.cell_of(x, y);
+                f64::from(self.grid.get(cx, cy))
+            }
+            1 => {
+                let (u, v) = self.context.cell_coords(x, y);
+                f64::from(self.grid.bilinear(u, v))
+            }
+            _ => {
+                let (u, v) = self.context.cell_coords(x, y);
+                f64::from(self.grid.bicubic(u, v))
+            }
         };
     }
 }
@@ -780,6 +1136,36 @@ mod tests {
     }
 
     #[test]
+    fn bicubic_passes_through_cell_centers_and_is_smooth() {
+        let grid =
+            AtlasGrid::from_values(4, 4, (0..16).map(|v| (v * v) as f32).collect()).unwrap();
+        assert_eq!(grid.bicubic(1.0, 2.0), grid.get(1, 2));
+        // Continuous across a cell border (no kink in value).
+        let left = grid.bicubic(1.999, 1.5);
+        let right = grid.bicubic(2.001, 1.5);
+        assert!((left - right).abs() < 0.1);
+    }
+
+    #[test]
+    fn river_network_finds_the_nearest_segment() {
+        let context = AtlasContext::new(1, (0, 0), (256, 256), 128, 16);
+        let network = RiverNetwork::new(
+            "n1",
+            vec![RiverPath {
+                points: vec![(8.0, 8.0), (200.0, 8.0)],
+                discharge: vec![10.0, 30.0],
+                level: vec![60.0, 40.0],
+            }],
+            context,
+        );
+        let hit = network.nearest(104.0, 20.0, 32.0).unwrap();
+        assert!((hit.distance - 12.0).abs() < 1e-4);
+        assert!((hit.discharge - 20.0).abs() < 1e-3);
+        assert!((hit.level - 50.0).abs() < 1e-3);
+        assert!(network.nearest(104.0, 100.0, 32.0).is_none());
+    }
+
+    #[test]
     fn downsampling_averages_blocks() {
         let grid =
             AtlasGrid::from_values(4, 2, vec![1.0, 3.0, 5.0, 7.0, 1.0, 3.0, 5.0, 7.0]).unwrap();
@@ -800,13 +1186,21 @@ mod tests {
                 AtlasGrid::from_values(4, 3, (0..12).map(|v| v as f32).collect()).unwrap(),
             )),
         ];
-        atlas.rivers = vec![(
-            "n9".into(),
-            vec![RiverPath {
-                points: vec![(1.0, 2.0), (3.0, 4.0)],
-                discharge: vec![5.0, 6.0],
-            }],
-        )];
+        atlas.rivers = vec![
+            None,
+            Some(Arc::new(RiverNetwork::new(
+                "n9",
+                vec![RiverPath {
+                    points: vec![(1.0, 2.0), (3.0, 4.0)],
+                    discharge: vec![5.0, 6.0],
+                    level: vec![50.0, 49.0],
+                }],
+                context,
+            ))),
+        ];
+        let mut strata = StrataGrid::uniform(4, 3, 2, 60.0);
+        strata.set_layers(5, &[(1, 10.0), (3, 70.0)]);
+        atlas.strata = vec![Some(Arc::new(strata))];
         atlas.signature = "sig".into();
 
         let mut bytes = Vec::new();
@@ -816,6 +1210,9 @@ mod tests {
         assert_eq!(read.context, atlas.context);
         assert_eq!(read.grids, atlas.grids);
         assert_eq!(read.rivers, atlas.rivers);
+        assert_eq!(read.strata, atlas.strata);
+        assert_eq!(read.materials.names(), atlas.materials.names());
+        assert_eq!(read.biomes.names(), atlas.biomes.names());
         assert_eq!(read.signature, "sig");
 
         assert!(Atlas::read(&mut &bytes[..bytes.len() - 3])

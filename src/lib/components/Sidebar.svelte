@@ -2,6 +2,8 @@
 	import type { AtlasStatus, Extent, FieldDef, WorldInfo } from '$lib/bridge';
 	import {
 		RAMPS,
+		isCategoricalRamp,
+		isPaletteRamp,
 		rampGradient,
 		type FieldSource,
 		type Ramp,
@@ -33,6 +35,7 @@
 	/** Shows a scrubber frame (index into `world.atlas.snapshots`), or null for the live view. */
 	export let onSnapshot: (index: number | null) => void = () => {};
 	export let onRivers: (visible: boolean) => void = () => {};
+	export let onGrid: (visible: boolean) => void = () => {};
 
 	let focusedNonce = 0;
 	$: if (world && focusField && focusField.nonce !== focusedNonce) {
@@ -133,6 +136,18 @@
 		if (value === null || value === undefined) return '–';
 		return Number.isInteger(value) ? String(value) : value.toFixed(2);
 	}
+
+	/** A value as the field shows it: material and biome ids by name. */
+	function formatField(def: FieldDef | undefined, value: number | null | undefined): string {
+		if (value === null || value === undefined || !def || !world) return format(value);
+		const table =
+			def.ramp === 'material' ? world.materials : def.ramp === 'biome' ? world.biomes : null;
+		if (!table) return format(value);
+		const entry = table[Math.round(value)];
+		return entry ? `${entry.label} (${Math.round(value)})` : format(value);
+	}
+
+	const swatch = (color: [number, number, number]) => `rgb(${color[0]} ${color[1]} ${color[2]})`;
 
 	$: gradient = rampGradient(ramp);
 	$: selectedDef = fieldsOf(source)[field];
@@ -241,6 +256,26 @@
 
 	let showRivers = false;
 	$: onRivers(showRivers);
+	// Remembered per machine (a view preference, not part of the project).
+	let showGrid = readGridSetting();
+	$: onGrid(showGrid);
+	$: writeGridSetting(showGrid);
+
+	function readGridSetting(): boolean {
+		try {
+			return localStorage.getItem('layervis.grid') !== 'off';
+		} catch {
+			return true;
+		}
+	}
+
+	function writeGridSetting(visible: boolean) {
+		try {
+			localStorage.setItem('layervis.grid', visible ? 'on' : 'off');
+		} catch {
+			// storage unavailable: the setting just isn't remembered
+		}
+	}
 
 	/** Nodes with scrubber frames, and the selected one. */
 	$: frameNodes = [...new Set(world?.atlas.snapshots.map((s) => s.node) ?? [])];
@@ -380,6 +415,10 @@
 				</select>
 			</div>
 
+			<label class="check">
+				<input type="checkbox" bind:checked={showGrid} /> Grid (chunk lines)
+			</label>
+
 			{#if world.atlas.fields.length}
 				<label class="check">
 					<input type="checkbox" bind:checked={showRivers} /> River lines (flow nodes)
@@ -403,6 +442,14 @@
 						{#if selectedDef?.unit}<span class="hint">{selectedDef.unit}</span>{/if}
 						<span>{format(max)}</span>
 					</div>
+				{:else if isPaletteRamp(ramp) && world}
+					<ul class="palette">
+						{#each ramp === 'material' ? world.materials : world.biomes as entry, id}
+							<li title="{entry.name} ({id})">
+								<span class="swatch" style:background={swatch(entry.color)}></span>{entry.label}
+							</li>
+						{/each}
+					</ul>
 				{:else}
 					<p class="hint">Categorical: a distinct color per integer value.</p>
 				{/if}
@@ -411,11 +458,11 @@
 			<div class="row">
 				<div class="field grow">
 					<label for="min">Min</label>
-					<input id="min" type="number" step="any" bind:value={min} disabled={ramp === 'categorical'} />
+					<input id="min" type="number" step="any" bind:value={min} disabled={isCategoricalRamp(ramp)} />
 				</div>
 				<div class="field grow">
 					<label for="max">Max</label>
-					<input id="max" type="number" step="any" bind:value={max} disabled={ramp === 'categorical'} />
+					<input id="max" type="number" step="any" bind:value={max} disabled={isCategoricalRamp(ramp)} />
 				</div>
 			</div>
 
@@ -423,7 +470,7 @@
 				<button
 					class="small"
 					title="Fit the range to the values currently loaded in view"
-					disabled={ramp === 'categorical'}
+					disabled={isCategoricalRamp(ramp)}
 					on:click={autoRange}
 				>
 					Auto range
@@ -504,6 +551,36 @@
 			{/each}
 		</SidebarSection>
 
+		<SidebarSection id="materials" title="Materials">
+			{#if world.materials.length}
+				<ul class="palette">
+					{#each world.materials as entry, id}
+						<li title="id {id}">
+							<span class="swatch" style:background={swatch(entry.color)}></span>
+							{entry.label} <span class="hint">{entry.detail}</span>
+						</li>
+					{/each}
+				</ul>
+			{:else}
+				<p class="hint">No material table.</p>
+			{/if}
+		</SidebarSection>
+
+		<SidebarSection id="biomes" title="Biomes">
+			{#if world.biomes.length}
+				<ul class="palette">
+					{#each world.biomes as entry, id}
+						<li title="{entry.name} · id {id}">
+							<span class="swatch" style:background={swatch(entry.color)}></span>
+							{entry.label}
+						</li>
+					{/each}
+				</ul>
+			{:else}
+				<p class="hint">No biome table.</p>
+			{/if}
+		</SidebarSection>
+
 		<SidebarSection id="cursor" title="Cursor">
 			{#if hover}
 				<dl class="facts">
@@ -517,18 +594,18 @@
 
 					{#each world.columnFields as def, index}
 						<dt title="{def.nodeLabel} {def.node}">{def.name} <small>{def.node}</small></dt>
-						<dd>{computed(def.key) ? format(hover.column?.[index]) : 'not yet'}</dd>
+						<dd>{computed(def.key) ? formatField(def, hover.column?.[index]) : 'not yet'}</dd>
 					{/each}
 
 					{#if hover.atlasValue !== null}
 						<dt>atlas <small>shown</small></dt>
-						<dd>{format(hover.atlasValue)}</dd>
+						<dd>{formatField(selectedDef, hover.atlasValue)}</dd>
 					{/if}
 
 					{#if hover.worldValues}
 						{#each world.worldFields as def, index}
 							<dt title="{def.nodeLabel} {def.node}">{def.name} <small>{def.node}</small></dt>
-							<dd>{format(hover.worldValues[index])}</dd>
+							<dd>{formatField(def, hover.worldValues[index])}</dd>
 						{/each}
 					{:else}
 						<dt>world</dt>
@@ -692,6 +769,33 @@
 
 
 
+
+	.palette {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 2px 8px;
+		font-size: 0.85em;
+	}
+
+	.palette li {
+		display: flex;
+		align-items: center;
+		gap: 5px;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	.swatch {
+		flex: none;
+		width: 10px;
+		height: 10px;
+		border-radius: 2px;
+		border: 1px solid rgba(0, 0, 0, 0.4);
+	}
 
 	.legend {
 		display: flex;

@@ -156,7 +156,7 @@ fn deferred_definition_builds_the_atlas_during_preparation() {
         .lock()
         .unwrap()
         .as_ref()
-        .is_some_and(|p| p.total == 4));
+        .is_some_and(|p| p.total == 12));
 
     // Column exports and point queries agree.
     let origin = chunk.origin();

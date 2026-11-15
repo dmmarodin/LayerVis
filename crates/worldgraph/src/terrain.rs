@@ -12,7 +12,7 @@ use crate::{
     pipeline::{BoxedWorldStep, Build, FieldSpec, InputSpec, NodeKind, ParamSpec, WorldStep},
     tectonics::{Tectonics, TectonicsConfig},
     world::{fbm, smoothstep, MAX_PLATES},
-    FieldScope, WORLD_SLOTS,
+    FieldScope, ValueKind, WORLD_SLOTS,
 };
 
 const fn world_out(
@@ -26,6 +26,7 @@ const fn world_out(
     FieldSpec {
         name: Cow::Borrowed(name),
         scope: FieldScope::World,
+        kind: ValueKind::Scalar,
         unit: Cow::Borrowed(unit),
         min,
         max,
@@ -41,6 +42,8 @@ const fn world_in(name: &'static str) -> InputSpec {
     InputSpec {
         name: Cow::Borrowed(name),
         scope: FieldScope::World,
+        kind: ValueKind::Scalar,
+        optional: false,
     }
 }
 
@@ -460,8 +463,20 @@ mod tests {
             // Atlas templates simulate erosion: keep it short in debug tests
             // (the edge falloff runs after it either way).
             let atlas = WorldStore::has_atlas_work(&doc);
-            for node in doc.nodes.iter_mut().filter(|n| n.kind == "erosion") {
-                node.params.insert("iterations".into(), 4.0);
+            for node in doc.nodes.iter_mut() {
+                match node.kind.as_str() {
+                    "erosion" => {
+                        node.params.insert("iterations".into(), 4.0);
+                    }
+                    "geology" => {
+                        node.params.insert("iterations".into(), 2.0);
+                        node.params.insert("epochs".into(), 2.0);
+                    }
+                    "moisture" => {
+                        node.params.insert("passes".into(), 10.0);
+                    }
+                    _ => {}
+                }
             }
             let slot = elevation_slot(&doc);
             let falloff = doc.nodes.iter().find(|n| n.kind == "edge_falloff").unwrap();

@@ -14,6 +14,8 @@ use serde::Serialize;
 
 use crate::{
     atlas::{Atlas, AtlasContext, AtlasHooks, DEFAULT_CELL_SIZE},
+    biomes::BiomeTable,
+    materials::MaterialTable,
     graph::GraphDoc,
     pipeline::{
         analyze, build_world_stage, resolve, world_signature, AtlasSource, Build, Implementation,
@@ -191,6 +193,21 @@ impl WorldStore {
         &self.atlas
     }
 
+    /// The world seed.
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// The world's material ids (voxel materials, strata, material grids).
+    pub fn materials(&self) -> &Arc<MaterialTable> {
+        self.atlas.materials()
+    }
+
+    /// The world's biome ids (biome grids and exports).
+    pub fn biomes(&self) -> &Arc<BiomeTable> {
+        self.atlas.biomes()
+    }
+
     /// The compiled world-scope nodes (empty for `new`).
     pub fn graph(&self) -> &WorldGraph {
         &self.graph
@@ -333,7 +350,7 @@ impl SplitMix {
     }
 }
 
-fn hash(seed: u64, x: i64, y: i64) -> u64 {
+pub(crate) fn hash(seed: u64, x: i64, y: i64) -> u64 {
     let mut h = seed ^ 0x9E37_79B9_7F4A_7C15;
     h ^= (x as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     h = h.rotate_left(31).wrapping_mul(0x94D0_49BB_1331_11EB);

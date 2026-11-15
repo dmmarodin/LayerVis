@@ -27,14 +27,16 @@ use serde::Serialize;
 use crate::script::{ScriptDef, ScriptStep};
 use crate::{
     atlas::{
-        Atlas, AtlasContext, AtlasGrid, AtlasHooks, AtlasIo, AtlasRun, BoxedAtlasStage, SampleStep,
-        ATLAS_SLOTS,
+        Atlas, AtlasContext, AtlasGrid, AtlasHooks, AtlasIo, AtlasRun, BoxedAtlasStage,
+        RiverNetwork, SampleStep, ATLAS_SLOTS,
     },
+    strata::StrataGrid,
     can_connect,
     graph::{id_order, GraphDoc, NodeDoc, SocketRef},
     steps,
     world::WorldStore,
-    ColumnData, FieldDef, FieldScope, Voxel, COLUMN_SLOTS, VOXEL_SLOTS, WORLD_SLOTS,
+    ColumnData, FieldDef, FieldScope, SocketType, ValueKind, Voxel, COLUMN_SLOTS, MATERIAL_SLOTS,
+    VOXEL_SLOTS, WORLD_SLOTS,
 };
 
 pub type BoxedStep = Box<dyn ChunkStep<Voxel, ColumnData, WorldStore>>;
@@ -99,6 +101,16 @@ pub const SCRIPT_KIND: &str = "script";
 pub struct InputSpec {
     pub name: Text,
     pub scope: FieldScope,
+    pub kind: ValueKind,
+    /// May stay unconnected: the node then runs without it
+    /// (`Bindings::optional_input` is None).
+    pub optional: bool,
+}
+
+impl InputSpec {
+    pub fn socket_type(&self) -> SocketType {
+        SocketType::new(self.scope, self.kind)
+    }
 }
 
 /// An output socket with its display defaults.
@@ -106,6 +118,7 @@ pub struct InputSpec {
 pub struct FieldSpec {
     pub name: Text,
     pub scope: FieldScope,
+    pub kind: ValueKind,
     pub unit: Text,
     pub min: f32,
     pub max: f32,
@@ -113,6 +126,12 @@ pub struct FieldSpec {
     /// Copy unit/range/ramp from the field wired into this input
     /// (re-processing nodes like Smooth).
     pub display_from: Option<Text>,
+}
+
+impl FieldSpec {
+    pub fn socket_type(&self) -> SocketType {
+        SocketType::new(self.scope, self.kind)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -163,6 +182,11 @@ impl Bindings {
             .ok_or_else(|| format!("input `{name}` is not bound"))
     }
 
+    /// The slot of an optional input, None when it is not connected.
+    pub fn optional_input(&self, name: &str) -> Option<usize> {
+        self.inputs.get(name).copied()
+    }
+
     pub fn output(&self, name: &str) -> Result<usize, String> {
         self.outputs
             .get(name)
@@ -189,6 +213,11 @@ pub enum Build {
     /// World-scope node: built once when the world is created, then evaluated
     /// per sample point. Inputs and outputs are world slots.
     World(fn(&Bindings, &Params, &WorldBuildContext) -> Result<BoxedWorldStep, String>),
+    /// World-scope node that also reads finished atlas data (strata, rivers,
+    /// grids) while it is built: its atlas inputs bind to atlas slots.
+    WorldAtlas(
+        fn(&Bindings, &Params, &WorldBuildContext, &Atlas) -> Result<BoxedWorldStep, String>,
+    ),
     /// Atlas-scope node: built and run once when the world is created, over
     /// whole grids. Inputs and outputs are atlas slots.
     Atlas(fn(&Bindings, &Params, &AtlasContext) -> Result<BoxedAtlasStage, String>),
@@ -354,10 +383,16 @@ impl Schema {
         self.scoped(FieldScope::Atlas)
     }
 
+    /// Scalar fields of one scope (the f32/f64 planes views show).
     fn scoped(&self, scope: FieldScope) -> Vec<FieldDef> {
+        self.fields_of(SocketType::scalar(scope))
+    }
+
+    /// Fields of one socket type (e.g. voxel materials, atlas strata).
+    pub fn fields_of(&self, socket: SocketType) -> Vec<FieldDef> {
         self.fields
             .iter()
-            .filter(|field| field.scope == scope)
+            .filter(|field| field.scope == socket.scope && field.kind == socket.kind)
             .cloned()
             .collect()
     }
@@ -387,6 +422,9 @@ pub enum NodeStatus {
 pub struct SocketReport {
     pub name: String,
     pub scope: FieldScope,
+    pub kind: ValueKind,
+    /// Inputs only: may stay unconnected.
+    pub optional: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -431,6 +469,7 @@ pub struct EdgeReport {
     pub to: SocketRef,
     /// Socket type, when both ends exist and agree.
     pub scope: Option<FieldScope>,
+    pub kind: Option<ValueKind>,
     /// False for dangling, mistyped or duplicate edges (input then unbound).
     pub valid: bool,
 }
@@ -443,6 +482,9 @@ pub struct Export {
     /// The Export node id.
     pub node: String,
     pub scope: FieldScope,
+    /// Scalar exports index column/voxel `slots`; material exports index
+    /// `Voxel::materials`.
+    pub kind: ValueKind,
     pub slot: usize,
     /// Key (`node.socket`) of the exported field.
     pub field: String,
@@ -546,14 +588,14 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
                 .outputs
                 .iter()
                 .find(|o| o.name == edge.from.socket)
-                .map(|o| o.scope)
+                .map(FieldSpec::socket_type)
         });
         let in_scope = to.and_then(|t| {
             contract(t)?
                 .inputs
                 .iter()
                 .find(|i| i.name == edge.to.socket)
-                .map(|i| i.scope)
+                .map(InputSpec::socket_type)
         });
 
         let valid = match (from, to, out_scope, in_scope) {
@@ -572,7 +614,11 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
             scope: out_scope
                 .zip(in_scope)
                 .filter(|(a, b)| can_connect(*a, *b))
-                .map(|(a, _)| a),
+                .map(|(a, _)| a.scope),
+            kind: out_scope
+                .zip(in_scope)
+                .filter(|(a, b)| can_connect(*a, *b))
+                .map(|(a, _)| a.kind),
             valid,
         });
     }
@@ -584,8 +630,8 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
     let mut runnable = vec![false; n];
     let mut order = Vec::new();
     let mut slots: HashMap<(usize, String), usize> = HashMap::new();
-    let (mut next_column, mut next_voxel, mut next_world, mut next_atlas) =
-        (0usize, 0usize, 0usize, 0usize);
+    // One slot space per socket type that has storage.
+    let mut next: HashMap<SocketType, usize> = HashMap::new();
     let mut export_names: HashMap<String, usize> = HashMap::new();
     // A chunk-scope input wired to a world output reads a column slot that
     // the world graph fills per column (one per distinct world output).
@@ -600,6 +646,13 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
             .find(|o| o.name == socket)
             .map(|o| o.scope)
     };
+    let output_kind = |node: usize, socket: &str| {
+        contract(node)?
+            .outputs
+            .iter()
+            .find(|o| o.name == socket)
+            .map(|o| o.kind)
+    };
 
     loop {
         let ready = by_id.iter().copied().find(|&i| {
@@ -608,9 +661,10 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
                 && reasons[i].is_none()
                 && contract(i).is_some_and(|c| {
                     c.inputs.iter().all(|input| {
-                        incoming
-                            .get(&(i, input.name.to_string()))
-                            .is_some_and(|(source, _)| runnable[*source])
+                        match incoming.get(&(i, input.name.to_string())) {
+                            Some((source, _)) => runnable[*source],
+                            None => input.optional,
+                        }
                     })
                 })
         });
@@ -633,10 +687,18 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
 
         // World outputs read by column inputs need a sampled column slot.
         let mut new_samples: Vec<(usize, String)> = Vec::new();
-        for input in &c.inputs {
-            let source = &incoming[&(i, input.name.to_string())];
-            if input.scope == FieldScope::Column
+        // Is this input a world scalar read by a chunk node (sampled)?
+        let sampled = |input: &InputSpec, source: &(usize, String)| {
+            input.scope == FieldScope::Column
+                && input.kind == ValueKind::Scalar
                 && output_scope(source.0, &source.1) == Some(FieldScope::World)
+                && output_kind(source.0, &source.1) == Some(ValueKind::Scalar)
+        };
+        for input in &c.inputs {
+            let Some(source) = incoming.get(&(i, input.name.to_string())) else {
+                continue; // an unconnected optional input
+            };
+            if sampled(input, source)
                 && !samples.contains_key(source)
                 && !new_samples.contains(source)
             {
@@ -646,40 +708,54 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
 
         // Reroutes take no slot of their own: their output is the input's slot.
         let outputs: &[FieldSpec] = if c.alias { &[] } else { &c.outputs };
-        let count = |scope| outputs.iter().filter(|o| o.scope == scope).count();
-        let (columns, voxels, worlds, atlases) = (
-            count(FieldScope::Column) + new_samples.len(),
-            count(FieldScope::Voxel),
-            count(FieldScope::World),
-            count(FieldScope::Atlas),
-        );
+        let mut wanted: Vec<(SocketType, usize)> = Vec::new();
+        let mut want = |socket: SocketType, count: usize| {
+            match wanted.iter_mut().find(|(s, _)| *s == socket) {
+                Some((_, n)) => *n += count,
+                None => wanted.push((socket, count)),
+            }
+        };
+        for output in outputs {
+            want(output.socket_type(), 1);
+        }
+        if !new_samples.is_empty() {
+            want(SocketType::scalar(FieldScope::Column), new_samples.len());
+        }
 
-        if next_column + columns > COLUMN_SLOTS
-            || next_voxel + voxels > VOXEL_SLOTS
-            || next_world + worlds > WORLD_SLOTS
-            || next_atlas + atlases > ATLAS_SLOTS
-        {
-            reasons[i] = Some(
-                "no free output slots (raise COLUMN_SLOTS/VOXEL_SLOTS/WORLD_SLOTS/ATLAS_SLOTS)"
-                    .into(),
-            );
+        let problem = wanted.iter().find_map(|(socket, count)| match slot_limit(*socket) {
+            None => Some(format!(
+                "{:?} {:?} outputs are not supported",
+                socket.scope, socket.kind
+            )),
+            Some(limit) if next.get(socket).copied().unwrap_or(0) + count > limit => Some(
+                "no free output slots (raise COLUMN_SLOTS/VOXEL_SLOTS/MATERIAL_SLOTS/\
+                 WORLD_SLOTS/ATLAS_SLOTS)"
+                    .to_owned(),
+            ),
+            Some(_) => None,
+        });
+        if let Some(problem) = problem {
+            reasons[i] = Some(problem);
             continue;
         }
 
         for source in new_samples {
-            samples.insert(source.clone(), next_column);
+            let counter = next
+                .entry(SocketType::scalar(FieldScope::Column))
+                .or_default();
+            samples.insert(source.clone(), *counter);
             world_samples.push(WorldSampleBinding {
                 world_slot: slots[&source],
-                column_slot: next_column,
+                column_slot: *counter,
             });
-            next_column += 1;
+            *counter += 1;
         }
 
         for input in &c.inputs {
-            let source = &incoming[&(i, input.name.to_string())];
-            let slot = if input.scope == FieldScope::Column
-                && output_scope(source.0, &source.1) == Some(FieldScope::World)
-            {
+            let Some(source) = incoming.get(&(i, input.name.to_string())) else {
+                continue;
+            };
+            let slot = if sampled(input, source) {
                 samples[source]
             } else {
                 slots[source]
@@ -693,12 +769,7 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
         }
 
         for output in outputs {
-            let counter = match output.scope {
-                FieldScope::Voxel => &mut next_voxel,
-                FieldScope::Column => &mut next_column,
-                FieldScope::World => &mut next_world,
-                FieldScope::Atlas => &mut next_atlas,
-            };
+            let counter = next.entry(output.socket_type()).or_default();
             slots.insert((i, output.name.to_string()), *counter);
             *counter += 1;
         }
@@ -722,6 +793,7 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
     for &i in &pending {
         for input in &contract(i).expect("eligible").inputs {
             match incoming.get(&(i, input.name.to_string())) {
+                None if input.optional => {}
                 None => {
                     reasons[i] = Some(format!("input `{}` is not connected", input.name));
                     break;
@@ -848,6 +920,7 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
                 node_label: title(i),
                 name: output.name.clone(),
                 scope: output.scope,
+                kind: output.kind,
                 slot: slots[&(i, output.name.to_string())],
                 unit: source_field
                     .as_ref()
@@ -867,9 +940,9 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
                     inputs: c
                         .inputs
                         .iter()
-                        .map(|input| {
-                            let slot = input_slots[&(i, input.name.to_string())];
-                            (input.name.to_string(), slot)
+                        .filter_map(|input| {
+                            let slot = input_slots.get(&(i, input.name.to_string()))?;
+                            Some((input.name.to_string(), *slot))
                         })
                         .collect(),
                     outputs: c
@@ -887,6 +960,8 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
             .map(|s| SocketReport {
                 name: s.name.to_string(),
                 scope: s.scope,
+                kind: s.kind,
+                optional: s.optional,
             })
             .collect()
     };
@@ -920,6 +995,8 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
                         .map(|s| SocketReport {
                             name: s.name.to_string(),
                             scope: s.scope,
+                            kind: s.kind,
+                            optional: false,
                         })
                         .collect()
                 }),
@@ -950,6 +1027,7 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
                 name: export_name(&doc.nodes[i]),
                 node: doc.nodes[i].id.clone(),
                 scope: input.scope,
+                kind: input.kind,
                 slot: input_slots[&(i, input.name.to_string())],
                 field: key(source, &socket),
             })
@@ -965,6 +1043,20 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
         edges,
         exports,
         world_samples,
+    }
+}
+
+/// How many slots one socket type has, or None when nothing stores it.
+fn slot_limit(socket: SocketType) -> Option<usize> {
+    use FieldScope::*;
+    use ValueKind::*;
+    match (socket.scope, socket.kind) {
+        (Column, Scalar) => Some(COLUMN_SLOTS),
+        (Voxel, Scalar) => Some(VOXEL_SLOTS),
+        (Voxel, Material) => Some(MATERIAL_SLOTS),
+        (World, Scalar) => Some(WORLD_SLOTS),
+        (Atlas, Scalar | Strata | Rivers) => Some(ATLAS_SLOTS),
+        _ => None,
     }
 }
 
@@ -1233,7 +1325,10 @@ pub fn build_world_stage(
             return Err("the saved atlas belongs to a different world size or seed".to_owned());
         }
         atlas.grids = stored.grids.clone();
+        atlas.strata = stored.strata.clone();
         atlas.rivers = stored.rivers.clone();
+        atlas.materials = Arc::clone(&stored.materials);
+        atlas.biomes = Arc::clone(&stored.biomes);
     }
 
     for &i in &analysis.order {
@@ -1262,6 +1357,11 @@ pub fn build_world_stage(
                 let step = build(bindings()?, params, context).map_err(|e| format!("{id}: {e}"))?;
                 steps.push((i, step));
             }
+            Build::WorldAtlas(build) => {
+                let step = build(bindings()?, params, context, &atlas)
+                    .map_err(|e| format!("{id}: {e}"))?;
+                steps.push((i, step));
+            }
             Build::Sample => {
                 let grid = atlas
                     .grids
@@ -1275,25 +1375,45 @@ pub fn build_world_stage(
                         grid,
                         context: atlas_context,
                         out: out_slot("out")?,
-                        bilinear: params.get("mode") >= 0.5,
+                        mode: params.get("mode").round().clamp(0.0, 2.0) as u8,
                     }),
                 ));
             }
             Build::Rasterize | Build::Atlas(_) if matches!(source, AtlasSource::Placeholder) => {
                 for output in outputs()? {
-                    store_grid(
-                        &mut atlas.grids,
-                        out_slot(&output.name)?,
-                        atlas_context.grid(0.0),
-                    );
+                    let slot = out_slot(&output.name)?;
+                    match output.kind {
+                        ValueKind::Strata => store(
+                            &mut atlas.strata,
+                            slot,
+                            StrataGrid::uniform(
+                                atlas_context.grid.0,
+                                atlas_context.grid.1,
+                                0,
+                                0.0,
+                            ),
+                        ),
+                        ValueKind::Rivers => store(
+                            &mut atlas.rivers,
+                            slot,
+                            RiverNetwork::new(id.clone(), Vec::new(), atlas_context),
+                        ),
+                        _ => store(&mut atlas.grids, slot, atlas_context.grid(0.0)),
+                    }
                 }
             }
             Build::Rasterize | Build::Atlas(_) if stored.is_some() => {
-                // A saved atlas: check its grids are there instead of computing them.
+                // A saved atlas: check its values are there instead of computing them.
                 for output in outputs()? {
-                    if atlas.grid(out_slot(&output.name)?).is_none() {
+                    let slot = out_slot(&output.name)?;
+                    let present = match output.kind {
+                        ValueKind::Strata => atlas.strata(slot).is_some(),
+                        ValueKind::Rivers => atlas.river_network(slot).is_some(),
+                        _ => atlas.grid(slot).is_some(),
+                    };
+                    if !present {
                         return Err(format!(
-                            "{id}: the saved atlas has no grid for `{}`",
+                            "{id}: the saved atlas has no data for `{}`",
                             output.name
                         ));
                     }
@@ -1315,7 +1435,7 @@ pub fn build_world_stage(
                     &mut run,
                 )
                 .map_err(|e| format!("{id}: {e}"))?;
-                store_grid(&mut atlas.grids, out_slot("out")?, grid);
+                store(&mut atlas.grids, out_slot("out")?, grid);
                 done += 1;
                 run.progress(1.0);
             }
@@ -1323,23 +1443,35 @@ pub fn build_world_stage(
                 run.begin(id, done);
                 let stage =
                     build(bindings()?, params, &atlas_context).map_err(|e| format!("{id}: {e}"))?;
-                let mut io = AtlasIo::new(&atlas_context, &atlas.grids);
+                let mut io = AtlasIo::new(&atlas);
                 stage
                     .run(&mut io, &mut run)
                     .map_err(|e| format!("{id}: {e}"))?;
-                let (written, rivers) = io.finish();
+                let written = io.finish();
 
                 for output in outputs()? {
                     let slot = out_slot(&output.name)?;
-                    if !written.iter().any(|(s, _)| *s == slot) {
+                    let present = match output.kind {
+                        ValueKind::Strata => written.strata.iter().any(|(s, _)| *s == slot),
+                        ValueKind::Rivers => written.rivers.iter().any(|(s, _)| *s == slot),
+                        _ => written.grids.iter().any(|(s, _)| *s == slot),
+                    };
+                    if !present {
                         return Err(format!("{id}: output `{}` was not written", output.name));
                     }
                 }
-                for (slot, grid) in written {
-                    store_grid(&mut atlas.grids, slot, grid);
+                for (slot, grid) in written.grids {
+                    store(&mut atlas.grids, slot, grid);
                 }
-                if let Some(rivers) = rivers {
-                    atlas.rivers.push((id.clone(), rivers));
+                for (slot, strata) in written.strata {
+                    store(&mut atlas.strata, slot, strata);
+                }
+                for (slot, paths) in written.rivers {
+                    store(
+                        &mut atlas.rivers,
+                        slot,
+                        RiverNetwork::new(id.clone(), paths, atlas_context),
+                    );
                 }
                 done += 1;
                 run.progress(1.0);
@@ -1357,11 +1489,11 @@ pub fn build_world_stage(
     ))
 }
 
-fn store_grid(grids: &mut Vec<Option<Arc<AtlasGrid>>>, slot: usize, grid: AtlasGrid) {
-    if grids.len() <= slot {
-        grids.resize(slot + 1, None);
+fn store<T>(values: &mut Vec<Option<Arc<T>>>, slot: usize, value: T) {
+    if values.len() <= slot {
+        values.resize_with(slot + 1, || None);
     }
-    grids[slot] = Some(Arc::new(grid));
+    values[slot] = Some(Arc::new(value));
 }
 
 /// Runnable nodes upstream of node `i` (through valid edges).

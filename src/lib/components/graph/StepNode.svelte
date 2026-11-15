@@ -97,17 +97,33 @@
 	<div class="sockets">
 		<div class="column">
 			{#each node.inputs as input (input.name)}
-				<div class="socket in" title="{input.name} ({input.scope})">
-					<Handle type="target" position={Position.Left} id={input.name} class="handle {input.scope}" />
+				<div
+					class="socket in"
+					title="{input.name} ({input.scope}{input.kind === 'scalar' ? '' : ` ${input.kind}`}{input.optional ? ', optional' : ''})"
+				>
+					<Handle
+						type="target"
+						position={Position.Left}
+						id={input.name}
+						class="handle {input.scope} kind-{input.kind} {input.optional ? 'optional' : ''}"
+					/>
 					<span>{input.name}</span>
 				</div>
 			{/each}
 		</div>
 		<div class="column right">
 			{#each node.outputs as output (output.name)}
-				<div class="socket out" title="{output.name} ({output.scope})">
+				<div
+					class="socket out"
+					title="{output.name} ({output.scope}{output.kind === 'scalar' ? '' : ` ${output.kind}`})"
+				>
 					<span>{output.name}</span>
-					<Handle type="source" position={Position.Right} id={output.name} class="handle {output.scope}" />
+					<Handle
+						type="source"
+						position={Position.Right}
+						id={output.name}
+						class="handle {output.scope} kind-{output.kind}"
+					/>
 				</div>
 			{/each}
 		</div>
@@ -285,6 +301,50 @@
 
 	.socket :global(.handle.atlas) {
 		background: #4fd1b5;
+	}
+
+	/* Value kinds: the color stays the scope, the shape is the kind. */
+	.socket :global(.handle.kind-material) {
+		width: 12px;
+		height: 12px;
+		border-radius: 0;
+		clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%);
+	}
+
+	.socket :global(.handle.kind-strata) {
+		border-radius: 1px;
+		background-image: repeating-linear-gradient(
+			0deg,
+			transparent 0 2px,
+			rgba(0, 0, 0, 0.45) 2px 3px
+		);
+	}
+
+	.socket :global(.handle.kind-rivers) {
+		border-radius: 1px;
+		background-image: linear-gradient(135deg, transparent 40%, #2b6fd6 40% 60%, transparent 60%);
+	}
+
+	/* Optional inputs: hollow. */
+	.socket :global(.handle.optional) {
+		background-color: #1b1d25;
+		border-width: 2px;
+	}
+
+	.socket :global(.handle.optional.world) {
+		border-color: #b58cf0;
+	}
+
+	.socket :global(.handle.optional.atlas) {
+		border-color: #4fd1b5;
+	}
+
+	.socket :global(.handle.optional.column) {
+		border-color: #6fa8ff;
+	}
+
+	.socket :global(.handle.optional.voxel) {
+		border-color: #e0a24f;
 	}
 
 	.scope-tag {

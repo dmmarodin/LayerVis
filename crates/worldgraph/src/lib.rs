@@ -20,15 +20,19 @@
 //! ```
 
 pub mod atlas;
+pub mod biomes;
 pub mod climate;
+pub mod detail;
 pub mod geology;
 pub mod graph;
 pub mod lru;
+pub mod materials;
 pub mod migrate;
 pub mod pipeline;
 #[cfg(feature = "scripting")]
 pub mod script;
 pub mod steps;
+pub mod strata;
 pub mod tectonics;
 pub mod terrain;
 pub mod world;
@@ -43,8 +47,12 @@ use serde::Serialize;
 
 pub use atlas::{
     Atlas, AtlasContext, AtlasGrid, AtlasHooks, AtlasIo, AtlasProgress, AtlasRun, AtlasSnapshot,
-    AtlasStage, BoxedAtlasStage, RiverPath, CANCELLED as ATLAS_CANCELLED, DEFAULT_CELL_SIZE,
+    AtlasStage, BoxedAtlasStage, RiverNetwork, RiverPath, CANCELLED as ATLAS_CANCELLED,
+    DEFAULT_CELL_SIZE,
 };
+pub use biomes::{BiomeDef, BiomeTable};
+pub use materials::{MaterialCategory, MaterialDef, MaterialTable};
+pub use strata::{StrataGrid, STRATA_LAYERS};
 pub use graph::Extent;
 pub use graph::{EdgeDoc, FrameDoc, GraphDoc, NodeDoc, SocketRef, DEFAULT_SEED};
 pub use lru::{ByteLru, Weigh};
@@ -59,14 +67,19 @@ use pipeline::{build_neighborhood, DynPipeline, ResolvedNode, Timings};
 
 /// One slot per node output (SSA), so column slots are generous.
 pub const VOXEL_SLOTS: usize = 4;
+/// Material-id (u16 registry id) outputs of voxel nodes.
+pub const MATERIAL_SLOTS: usize = 4;
 pub const COLUMN_SLOTS: usize = 16;
 /// World-scope outputs (one slot per world node output).
-pub const WORLD_SLOTS: usize = 16;
+pub const WORLD_SLOTS: usize = 32;
 
 /// Field-bag voxel: outputs map to fixed slots via the schema.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Voxel {
     pub slots: [f32; VOXEL_SLOTS],
+    /// Material ids (indices into the world's `MaterialTable`), one per
+    /// material output (`export_material` names them).
+    pub materials: [u16; MATERIAL_SLOTS],
 }
 
 /// LayerGen chunk data `C`: one slot array per (x, y) column.
@@ -92,10 +105,11 @@ impl Weigh for Arc<ColumnData> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FieldScope {
     Voxel,
+    #[default]
     Column,
     World,
     /// Whole-world grids computed once per world (see `atlas.rs`).
@@ -121,13 +135,50 @@ impl FieldScope {
     }
 }
 
-/// Can an output of scope `from` be wired into an input of scope `to`?
-/// Equal types connect; a world output may also feed a column input (it is
-/// sampled at every column). Nothing flows from chunk or voxel scope into
-/// world nodes, and voxel inputs only take voxel values. Atlas sockets only
-/// connect to atlas sockets (world ↔ atlas goes through `rasterize` / `sample`).
-pub fn can_connect(from: FieldScope, to: FieldScope) -> bool {
-    from == to || (from == FieldScope::World && to == FieldScope::Column)
+/// What a socket carries, orthogonal to its scope.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ValueKind {
+    /// One f32 (f64 at world scope) per sample: today's sockets.
+    #[default]
+    Scalar,
+    /// A u16 material id (an index into the world's `MaterialTable`).
+    Material,
+    /// Atlas only: per-cell rock layers (`StrataGrid`).
+    Strata,
+    /// Atlas only: river lines with a spatial index (`RiverNetwork`).
+    Rivers,
+}
+
+/// The full type of a socket: where its value lives and what it is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SocketType {
+    pub scope: FieldScope,
+    pub kind: ValueKind,
+}
+
+impl SocketType {
+    pub const fn new(scope: FieldScope, kind: ValueKind) -> Self {
+        Self { scope, kind }
+    }
+
+    pub const fn scalar(scope: FieldScope) -> Self {
+        Self::new(scope, ValueKind::Scalar)
+    }
+}
+
+/// Can an output of type `from` be wired into an input of type `to`?
+/// Kinds must be equal. Equal scopes connect; a world output may also feed a
+/// column input (it is sampled at every column). Nothing flows from chunk or
+/// voxel scope into world nodes, and voxel inputs only take voxel values.
+/// Atlas sockets only connect to atlas sockets (world ↔ atlas scalars go
+/// through `rasterize` / `sample`); a chunk or world node may still declare an
+/// atlas input (strata, rivers) and read it from the finished atlas directly.
+pub fn can_connect(from: SocketType, to: SocketType) -> bool {
+    from.kind == to.kind
+        && (from.scope == to.scope
+            || (from.scope == FieldScope::World && to.scope == FieldScope::Column))
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -142,6 +193,8 @@ pub struct FieldDef {
     /// Socket name.
     pub name: Text,
     pub scope: FieldScope,
+    /// Value kind; `slot` indexes that kind's slot space.
+    pub kind: ValueKind,
     pub slot: usize,
     pub unit: Text,
     /// Default display range for view modes.
@@ -421,7 +474,11 @@ impl DeferredGraphDefinition {
             .schema
             .fields
             .iter()
-            .find(|field| field.key == export.field && field.scope == FieldScope::World)
+            .find(|field| {
+                field.key == export.field
+                    && field.scope == FieldScope::World
+                    && field.kind == ValueKind::Scalar
+            })
             .map(|field| field.slot)
     }
 
