@@ -11,18 +11,20 @@ use layergen::{
 };
 
 use crate::{
+    atlas::{RASTERIZE, REROUTE_ATLAS, SAMPLE},
+    climate::{HUMIDITY, TEMPERATURE},
+    geology::{EROSION, FLOW, TECTONIC_UPLIFT},
     graph::{EdgeDoc, GraphDoc, NodeDoc, SocketRef},
     pipeline::{
         Bindings, BoxedNeighborhoodStep, BoxedStep, BoxedWorldStep, Build, FieldSpec, InputSpec,
         NodeKind, ParamSpec, Params, WorldStep,
     },
-    climate::{HUMIDITY, TEMPERATURE},
     terrain::{EDGE_FALLOFF, TECTONICS, TECTONIC_ELEVATION},
     world::WorldStore,
     ColumnData, FieldScope, Voxel, WORLD_SLOTS,
 };
 
-static REGISTRY: [&NodeKind; 15] = [
+static REGISTRY: [&NodeKind; 21] = [
     &TECTONICS,
     &TECTONIC_ELEVATION,
     &EDGE_FALLOFF,
@@ -38,6 +40,12 @@ static REGISTRY: [&NodeKind; 15] = [
     &WORLD_NOISE,
     &WORLD_REMAP,
     &REROUTE_WORLD,
+    &RASTERIZE,
+    &SAMPLE,
+    &REROUTE_ATLAS,
+    &TECTONIC_UPLIFT,
+    &EROSION,
+    &FLOW,
 ];
 
 /// Every registered built-in node kind.
@@ -59,7 +67,7 @@ pub struct GraphTemplate {
 
 /// Starting graphs: the original scattered-land world and a few continent
 /// layouts (each ends in an edge falloff, so the map is ocean all round).
-pub static TEMPLATES: [GraphTemplate; 5] = [
+pub static TEMPLATES: [GraphTemplate; 6] = [
     GraphTemplate {
         id: "default",
         label: "Default (scattered land)",
@@ -114,6 +122,12 @@ pub static TEMPLATES: [GraphTemplate; 5] = [
             ])
         },
     },
+    GraphTemplate {
+        id: "eroded_continent",
+        label: "Eroded continent (atlas)",
+        description: "One continent shaped by tectonic uplift and stream-power erosion on the                       atlas, with lakes and rivers from the flow node.",
+        build: eroded_graph,
+    },
 ];
 
 /// Graph of a fresh session: tectonics → tectonic elevation (world nodes),
@@ -126,11 +140,7 @@ pub fn default_graph() -> GraphDoc {
 /// The default graph with different tectonics params and an edge falloff
 /// filter behind the elevation.
 fn continents_graph(tectonics: &[(&str, f64)]) -> GraphDoc {
-    let falloff = [
-        ("margin", 0.08),
-        ("falloff", 0.14),
-        ("noise", 0.05),
-    ];
+    let falloff = [("margin", 0.08), ("falloff", 0.14), ("noise", 0.05)];
     terrain_graph(tectonics, Some(&falloff))
 }
 
@@ -206,6 +216,88 @@ fn terrain_graph(tectonics: &[(&str, f64)], falloff: Option<&[(&str, f64)]>) -> 
         seed: crate::graph::DEFAULT_SEED,
         frames: Vec::new(),
         world: Default::default(),
+        extent: None,
+        nodes,
+        edges,
+    }
+}
+
+/// tectonics → elevation + uplift → rasterize → erosion → flow, with the eroded
+/// elevation sampled back to world scope and pulled to the sea at the edges.
+pub fn eroded_graph() -> GraphDoc {
+    let node = |id: &str, kind: &str, x: f64, y: f64, params: &[(&str, f64)]| NodeDoc {
+        id: id.into(),
+        kind: kind.into(),
+        enabled: true,
+        position: (x, y),
+        params: params.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect(),
+        script: None,
+        label: None,
+    };
+    let edge = |from: &str, out: &str, to: &str, input: &str| EdgeDoc {
+        from: SocketRef {
+            node: from.into(),
+            socket: out.into(),
+        },
+        to: SocketRef {
+            node: to.into(),
+            socket: input.into(),
+        },
+    };
+
+    let tectonics = [
+        ("plate_size", 1100.0),
+        ("continents", 1.0),
+        ("continental_fraction", 0.3),
+    ];
+    let falloff = [("margin", 0.08), ("falloff", 0.14), ("noise", 0.05)];
+    let mut nodes = vec![
+        node("n1", "tectonics", 0.0, 0.0, &tectonics),
+        node("n2", "tectonic_elevation", 340.0, -80.0, &[]),
+        node("n3", "tectonic_uplift", 340.0, 160.0, &[]),
+        node("n4", "rasterize", 680.0, -80.0, &[("supersample", 2.0)]),
+        node("n5", "rasterize", 680.0, 160.0, &[]),
+        node("n6", "erosion", 1020.0, 0.0, &[]),
+        node("n7", "flow", 1360.0, 160.0, &[]),
+        node("n8", "sample", 1360.0, -80.0, &[]),
+        node("n9", "edge_falloff", 1700.0, -80.0, &falloff),
+        node("n10", "temperature", 2040.0, -140.0, &[]),
+        node("n11", "solid", 2040.0, 40.0, &[]),
+    ];
+    nodes.push(NodeDoc {
+        label: Some("height".into()),
+        ..node("n12", "export_column", 2040.0, 220.0, &[])
+    });
+
+    let mut edges = Vec::new();
+    for socket in [
+        "boundary_distance",
+        "convergence",
+        "continental",
+        "neighbor_continental",
+    ] {
+        edges.push(edge("n1", socket, "n2", socket));
+        edges.push(edge("n1", socket, "n3", socket));
+    }
+    edges.extend([
+        edge("n2", "elevation", "n4", "in"),
+        edge("n3", "uplift", "n5", "in"),
+        edge("n4", "out", "n6", "elevation"),
+        edge("n5", "out", "n6", "uplift"),
+        edge("n6", "elevation", "n7", "elevation"),
+        edge("n6", "elevation", "n8", "in"),
+        edge("n8", "out", "n9", "elevation"),
+        edge("n9", "elevation", "n10", "elevation"),
+        edge("n9", "elevation", "n11", "elevation"),
+        edge("n9", "elevation", "n12", "value"),
+    ]);
+
+    GraphDoc {
+        format: crate::graph::FORMAT,
+        seed: crate::graph::DEFAULT_SEED,
+        frames: Vec::new(),
+        world: Default::default(),
+        extent: None,
         nodes,
         edges,
     }
@@ -376,7 +468,8 @@ impl NeighborhoodChunkStep<Voxel, ColumnData, WorldStore> for SmoothStep {
             for dy in -self.radius..=self.radius {
                 for dx in -self.radius..=self.radius {
                     // Outside-world samples are skipped, not zero-padded.
-                    if let Some(v) = neighbor_column(chunks, context, gx + dx, gy + dy, self.value)? {
+                    if let Some(v) = neighbor_column(chunks, context, gx + dx, gy + dy, self.value)?
+                    {
                         total += f64::from(v);
                         count += 1;
                     }
@@ -568,7 +661,9 @@ pub static WORLD_NOISE: NodeKind = NodeKind {
     build: Build::World(|bindings, params, context| {
         Ok(Box::new(NoiseWorldStep {
             out: bindings.output("noise")?,
-            seed: context.seed ^ 0x6E01_0000 ^ (params.get("variant") as u64).wrapping_mul(0x9E37_79B9),
+            seed: context.seed
+                ^ 0x6E01_0000
+                ^ (params.get("variant") as u64).wrapping_mul(0x9E37_79B9),
             wavelength: params.get("wavelength"),
             octaves: params.get("octaves").round() as u32,
         }) as BoxedWorldStep)

@@ -9,10 +9,7 @@
 use std::borrow::Cow;
 
 use crate::{
-    pipeline::{
-        BoxedWorldStep, Build, FieldSpec, InputSpec, NodeKind, ParamSpec,
-        WorldStep,
-    },
+    pipeline::{BoxedWorldStep, Build, FieldSpec, InputSpec, NodeKind, ParamSpec, WorldStep},
     tectonics::{Tectonics, TectonicsConfig},
     world::{fbm, smoothstep, MAX_PLATES},
     FieldScope, WORLD_SLOTS,
@@ -205,8 +202,7 @@ impl WorldStep for TectonicElevationStep {
         // Blend plate base heights near the boundary to avoid cliffs.
         let own = base(own_continental);
         let blend = smoothstep(0.0, 180.0, distance);
-        let mut height =
-            (own + base(neighbor_continental)) / 2.0 * (1.0 - blend) + own * blend;
+        let mut height = (own + base(neighbor_continental)) / 2.0 * (1.0 - blend) + own * blend;
 
         // Boundary effects fall off with distance from the boundary.
         let falloff = (-distance / 160.0).exp();
@@ -355,7 +351,13 @@ mod tests {
         let sample = tectonics.sample(x, y);
         let depth = 128.0;
 
-        let base = |index: usize| if plates[index].continental { 0.55 } else { 0.22 };
+        let base = |index: usize| {
+            if plates[index].continental {
+                0.55
+            } else {
+                0.22
+            }
+        };
         let own = base(sample.plate);
         let blend = smoothstep(0.0, 180.0, sample.boundary_distance);
         let mut height = (own + base(sample.neighbor)) / 2.0 * (1.0 - blend) + own * blend;
@@ -385,7 +387,12 @@ mod tests {
     }
 
     fn legacy_tectonics(seed: u64) -> Tectonics {
-        Tectonics::generate(seed, (-4096, -4096), (8192, 8192), &TectonicsConfig::default())
+        Tectonics::generate(
+            seed,
+            (-4096, -4096),
+            (8192, 8192),
+            &TectonicsConfig::default(),
+        )
     }
 
     #[test]
@@ -441,18 +448,26 @@ mod tests {
     fn template_stats(template: &GraphTemplate, seed: u64) -> WorldStats {
         let doc = (template.build)();
         let slot = elevation_slot(&doc);
-        WorldStore::for_doc(&doc, &config(seed)).unwrap().stats(slot, 96)
+        WorldStore::for_doc(&doc, &config(seed))
+            .unwrap()
+            .stats(slot, 96)
     }
 
     #[test]
     fn continent_templates_leave_ocean_on_all_four_edges() {
         for template in TEMPLATES.iter().filter(|t| t.id != "default") {
-            let doc = (template.build)();
+            let mut doc = (template.build)();
+            // Atlas templates simulate erosion: keep it short in debug tests
+            // (the edge falloff runs after it either way).
+            let atlas = WorldStore::has_atlas_work(&doc);
+            for node in doc.nodes.iter_mut().filter(|n| n.kind == "erosion") {
+                node.params.insert("iterations".into(), 4.0);
+            }
             let slot = elevation_slot(&doc);
             let falloff = doc.nodes.iter().find(|n| n.kind == "edge_falloff").unwrap();
             let margin = falloff.params["margin"] * 8192.0;
 
-            for seed in 1..=6 {
+            for seed in 1..=(if atlas { 1 } else { 6 }) {
                 let world = WorldStore::for_doc(&doc, &config(seed)).unwrap();
                 let sea = f64::from(world.sea_level());
                 let (lo, hi) = (-4096, 4095);
@@ -498,8 +513,15 @@ mod tests {
                 single.land_fraction
             );
 
-            assert!(template_stats(template("archipelago"), seed).landmasses >= 3, "seed {seed}");
-            assert_eq!(template_stats(template("pangaea"), seed).landmasses, 1, "seed {seed}");
+            assert!(
+                template_stats(template("archipelago"), seed).landmasses >= 3,
+                "seed {seed}"
+            );
+            assert_eq!(
+                template_stats(template("pangaea"), seed).landmasses,
+                1,
+                "seed {seed}"
+            );
         }
 
         // Two continents; island arcs can occasionally join neighbors into one.
@@ -518,7 +540,9 @@ mod tests {
             "edges": [{"from": {"node": "n1", "socket": "elevation"}, "to": {"node": "n2", "socket": "value"}}]}"#;
         let doc = GraphDoc::from_json(old).unwrap();
         let slot = elevation_slot(&doc);
-        let stats = WorldStore::for_doc(&doc, &config(3)).unwrap().stats(slot, 96);
+        let stats = WorldStore::for_doc(&doc, &config(3))
+            .unwrap()
+            .stats(slot, 96);
 
         assert_eq!(stats.edge_land, 0.0);
         assert_eq!(stats.landmasses, 1);

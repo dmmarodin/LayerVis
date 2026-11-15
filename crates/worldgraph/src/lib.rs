@@ -19,7 +19,9 @@
 //! // later: chunk.chunk_data().columns[(x, y, 0)][height.slot]
 //! ```
 
+pub mod atlas;
 pub mod climate;
+pub mod geology;
 pub mod graph;
 pub mod lru;
 pub mod migrate;
@@ -31,7 +33,7 @@ pub mod tectonics;
 pub mod terrain;
 pub mod world;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use layergen::{
     Chunk, ChunkCoord, ChunkStep, DataSet, GenerationDefinition, Neighborhood, NeighborhoodLimits,
@@ -39,12 +41,17 @@ use layergen::{
 };
 use serde::Serialize;
 
+pub use atlas::{
+    Atlas, AtlasContext, AtlasGrid, AtlasHooks, AtlasIo, AtlasProgress, AtlasRun, AtlasSnapshot,
+    AtlasStage, BoxedAtlasStage, RiverPath, CANCELLED as ATLAS_CANCELLED, DEFAULT_CELL_SIZE,
+};
+pub use graph::Extent;
 pub use graph::{EdgeDoc, FrameDoc, GraphDoc, NodeDoc, SocketRef, DEFAULT_SEED};
 pub use lru::{ByteLru, Weigh};
 pub use pipeline::{
-    analyze, build_world_graph, creates_cycle, resolve, world_signature, Analysis, EdgeReport,
-    Export, NodeReport, NodeStatus, ParamReport, Schema, StepTiming, Text, WorldBuildContext,
-    WorldGraph, WorldSampleBinding, WorldStep,
+    analyze, build_world_stage, creates_cycle, resolve, world_signature, Analysis, AtlasSource,
+    EdgeReport, Export, NodeReport, NodeStatus, ParamReport, Schema, StepTiming, Text,
+    WorldBuildContext, WorldGraph, WorldSampleBinding, WorldStep,
 };
 pub use world::{WorldStats, WorldStore};
 
@@ -91,16 +98,25 @@ pub enum FieldScope {
     Voxel,
     Column,
     World,
+    /// Whole-world grids computed once per world (see `atlas.rs`).
+    Atlas,
 }
 
 impl FieldScope {
+    /// Computed once per world (world and atlas scopes), never per chunk.
+    pub fn is_world_stage(self) -> bool {
+        matches!(self, FieldScope::World | FieldScope::Atlas)
+    }
+
     /// Wires run downward through the scopes: world values feed chunk nodes
-    /// (sampled once per column), never the other way around.
+    /// (sampled once per column), never the other way around. Atlas and world
+    /// meet only through the `rasterize` / `sample` adapter nodes.
     pub fn rank(self) -> u8 {
         match self {
-            FieldScope::World => 0,
-            FieldScope::Column => 1,
-            FieldScope::Voxel => 2,
+            FieldScope::Atlas => 0,
+            FieldScope::World => 1,
+            FieldScope::Column => 2,
+            FieldScope::Voxel => 3,
         }
     }
 }
@@ -108,7 +124,8 @@ impl FieldScope {
 /// Can an output of scope `from` be wired into an input of scope `to`?
 /// Equal types connect; a world output may also feed a column input (it is
 /// sampled at every column). Nothing flows from chunk or voxel scope into
-/// world nodes, and voxel inputs only take voxel values.
+/// world nodes, and voxel inputs only take voxel values. Atlas sockets only
+/// connect to atlas sockets (world ↔ atlas goes through `rasterize` / `sample`).
 pub fn can_connect(from: FieldScope, to: FieldScope) -> bool {
     from == to || (from == FieldScope::World && to == FieldScope::Column)
 }
@@ -135,8 +152,7 @@ pub struct FieldDef {
 }
 
 /// The LayerGen definition type every graph builds into.
-pub type Definition =
-    dyn GenerationDefinition<Voxel, Shared = WorldStore, ChunkData = ColumnData>;
+pub type Definition = dyn GenerationDefinition<Voxel, Shared = WorldStore, ChunkData = ColumnData>;
 
 /// Neighborhood prefix results are column data per chunk: this holds a few
 /// thousand chunks per pipeline.
@@ -225,7 +241,11 @@ impl GraphPipeline {
         let range = |range| DynPipeline::build(doc, &resolved, &analysis, world, range, &timings);
 
         let definition: Arc<Definition> = match analysis.prefix_len {
-            None => Arc::new(base().add_chunk_step(range(0..steps)?).build(|_| Voxel::default())),
+            None => Arc::new(
+                base()
+                    .add_chunk_step(range(0..steps)?)
+                    .build(|_| Voxel::default()),
+            ),
             Some(prefix_len) => {
                 // LayerGen stages: prefix (re-run per dependency chunk), then
                 // one neighborhood node, then suffix (once per requested chunk).
@@ -350,5 +370,107 @@ impl GenerationDefinition<Voxel> for GraphDefinition {
         shared: &WorldStore,
     ) -> Result<Chunk<Voxel, ColumnData>, String> {
         self.inner.generate_chunk_with_shared(coord, shared)
+    }
+}
+
+/// A LayerGen definition that builds its world (atlas included) in LayerGen's
+/// **preparation** step: `LayerGenPlugin` runs it on the task pool when the
+/// app starts, and chunk jobs wait until it is ready. Use it when the world
+/// takes a while to build (atlas nodes) and the app should keep running
+/// meanwhile; `GraphPipeline::definition` needs an already built world.
+///
+/// Exports are known up front (they only depend on the graph), so game code
+/// can look up slots before the world is ready.
+pub struct DeferredGraphDefinition {
+    doc: GraphDoc,
+    config: PipelineConfig,
+    analysis: Analysis,
+    pipeline: OnceLock<GraphPipeline>,
+    progress: Arc<Mutex<Option<AtlasProgress>>>,
+}
+
+impl DeferredGraphDefinition {
+    pub fn new(doc: GraphDoc, config: PipelineConfig) -> Self {
+        let resolved: Vec<ResolvedNode> = doc.nodes.iter().map(resolve).collect();
+        let analysis = analyze(&doc, &resolved);
+
+        Self {
+            doc,
+            config,
+            analysis,
+            pipeline: OnceLock::new(),
+            progress: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn exports(&self) -> &[Export] {
+        &self.analysis.exports
+    }
+
+    pub fn export(&self, name: &str) -> Option<&Export> {
+        self.analysis.exports.iter().find(|e| e.name == name)
+    }
+
+    /// The world slot behind an export of a world value (exports of world
+    /// values hand chunks a sampled column copy; this is the original), for
+    /// point queries anywhere: `world.graph().eval(x, y)[slot]`. None for
+    /// unknown exports and exports of chunk or voxel values.
+    pub fn export_world_slot(&self, name: &str) -> Option<usize> {
+        let export = self.export(name)?;
+        self.analysis
+            .schema
+            .fields
+            .iter()
+            .find(|field| field.key == export.field && field.scope == FieldScope::World)
+            .map(|field| field.slot)
+    }
+
+    /// The latest atlas build progress while preparing (None before the first
+    /// report). Clone it before handing the definition to `LayerGenPlugin`.
+    pub fn progress_handle(&self) -> Arc<Mutex<Option<AtlasProgress>>> {
+        Arc::clone(&self.progress)
+    }
+}
+
+impl GenerationDefinition<Voxel> for DeferredGraphDefinition {
+    type Shared = WorldStore;
+    type ChunkData = ColumnData;
+
+    fn config(&self) -> PipelineConfig {
+        self.config
+    }
+
+    fn requires_preparation(&self) -> bool {
+        true
+    }
+
+    fn prepare_shared(&self) -> Result<Arc<WorldStore>, String> {
+        let progress = |p: &AtlasProgress| {
+            *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = Some(p.clone());
+        };
+        let hooks = AtlasHooks {
+            progress: Some(&progress),
+            cancelled: None,
+        };
+        let world = Arc::new(WorldStore::for_doc_with(&self.doc, &self.config, hooks)?);
+        // Repeated direct calls build the same world again (deterministic):
+        // the first pipeline stays.
+        if self.pipeline.get().is_none() {
+            let _ = self
+                .pipeline
+                .set(GraphPipeline::build(&self.doc, self.config, &world)?);
+        }
+        Ok(world)
+    }
+
+    fn generate_chunk_with_shared(
+        &self,
+        coord: ChunkCoord,
+        shared: &WorldStore,
+    ) -> Result<Chunk<Voxel, ColumnData>, String> {
+        self.pipeline
+            .get()
+            .ok_or_else(|| "the world is not prepared yet".to_owned())?
+            .generate(coord, shared)
     }
 }

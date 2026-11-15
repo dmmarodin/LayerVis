@@ -7,13 +7,15 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use generation::{CacheStats, PipelineGraph, Session, StepTiming, WorldInfo};
-use worldgraph::{GraphDoc, SocketRef, DEFAULT_SEED};
+use generation::{
+    AtlasStatus, CacheStats, PipelineGraph, RiverSet, Session, StepTiming, WorldInfo,
+};
 use layergen::ChunkCoord;
-use serde::{Deserialize, Serialize};
 use project::{Project, ProjectState};
+use serde::{Deserialize, Serialize};
 use tauri::{ipc::Response, Manager, State, WebviewWindow};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use worldgraph::{Extent, GraphDoc, SocketRef, DEFAULT_SEED};
 
 const GRAPH_FILE: &str = "graph.json";
 const INVALID_GRAPH_FILE: &str = "graph.invalid.json";
@@ -57,8 +59,8 @@ fn load_session(path: &Path) -> Session {
 /// Writes the current doc atomically (temp file + rename).
 fn save(session: &Session, file: &GraphFile) {
     let temp = file.0.with_extension("json.tmp");
-    let result = fs::write(&temp, session.graph_doc().to_json())
-        .and_then(|()| fs::rename(&temp, &file.0));
+    let result =
+        fs::write(&temp, session.graph_doc().to_json()).and_then(|()| fs::rename(&temp, &file.0));
 
     if let Err(error) = result {
         eprintln!("LayerVis: autosave to {} failed: {error}", file.0.display());
@@ -105,11 +107,10 @@ async fn generate_chunk(
 ) -> Result<Response, String> {
     let session = Arc::clone(&session);
 
-    let bytes = tauri::async_runtime::spawn_blocking(move || {
-        session.column_payload(ChunkCoord(x, y, z))
-    })
-    .await
-    .map_err(|error| format!("Generation task failed: {error}"))??;
+    let bytes =
+        tauri::async_runtime::spawn_blocking(move || session.column_payload(ChunkCoord(x, y, z)))
+            .await
+            .map_err(|error| format!("Generation task failed: {error}"))??;
 
     Ok(Response::new(bytes.as_ref().clone()))
 }
@@ -138,6 +139,53 @@ async fn sample_world(
 #[tauri::command]
 fn world_point(session: State<'_, SharedSession>, x: i64, y: i64) -> Option<Vec<f64>> {
     session.world_point(x, y)
+}
+
+// ---------------------------------------------------------------------------
+// Atlas
+
+/// What the background atlas build is doing (polled while one runs).
+#[tauri::command]
+fn atlas_status(session: State<'_, SharedSession>) -> AtlasStatus {
+    session.atlas_status()
+}
+
+/// One atlas grid by slot (`WorldInfo.atlas.fields`), as a field-plane payload.
+#[tauri::command]
+async fn atlas_grid(session: State<'_, SharedSession>, slot: usize) -> Result<Response, String> {
+    let session = Arc::clone(&session);
+    let bytes = tauri::async_runtime::spawn_blocking(move || session.atlas_payload(slot))
+        .await
+        .map_err(|error| format!("Atlas task failed: {error}"))??;
+    Ok(Response::new(bytes))
+}
+
+/// One scrubber frame (`WorldInfo.atlas.snapshots` index), as a payload.
+#[tauri::command]
+async fn atlas_snapshot(
+    session: State<'_, SharedSession>,
+    index: usize,
+) -> Result<Response, String> {
+    let session = Arc::clone(&session);
+    let bytes = tauri::async_runtime::spawn_blocking(move || session.atlas_snapshot_payload(index))
+        .await
+        .map_err(|error| format!("Atlas task failed: {error}"))??;
+    Ok(Response::new(bytes))
+}
+
+#[tauri::command]
+fn atlas_rivers(session: State<'_, SharedSession>) -> Result<Vec<RiverSet>, String> {
+    session.atlas_rivers()
+}
+
+/// World size, depth and atlas cell size (undoable; builds a new world).
+#[tauri::command]
+async fn set_extent(
+    session: State<'_, SharedSession>,
+    file: State<'_, GraphFile>,
+    extent: Extent,
+) -> Result<PipelineGraph, String> {
+    edit(&session, &file, move |s| s.set_extent(extent)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -255,7 +303,10 @@ async fn update_frame(
 ) -> Result<PipelineGraph, String> {
     let position = x.zip(y);
     let size = width.zip(height);
-    edit(&session, &file, move |s| s.update_frame(&id, label, position, size)).await
+    edit(&session, &file, move |s| {
+        s.update_frame(&id, label, position, size)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -366,7 +417,9 @@ fn step_timings(session: State<'_, SharedSession>) -> Timings {
 // Project files (menu bar)
 
 fn lock_project(project: &SharedProject) -> std::sync::MutexGuard<'_, Project> {
-    project.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    project
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn describe(session: &Session, project: &SharedProject) -> ProjectState {
@@ -514,7 +567,11 @@ fn do_save(window: &WebviewWindow, mode: SaveMode) -> Result<Option<ProjectState
     let target = match (mode, current) {
         (SaveMode::Save, Some(path)) => path,
         (mode, _) => {
-            let title = if mode == SaveMode::ExportCopy { "Export a copy" } else { "Save graph as" };
+            let title = if mode == SaveMode::ExportCopy {
+                "Export a copy"
+            } else {
+                "Save graph as"
+            };
             match pick_save(window, title, &name)? {
                 Some(path) => path,
                 None => return Ok(None),
@@ -560,7 +617,10 @@ fn list_templates() -> Vec<generation::TemplateInfo> {
 
 /// Starts an untitled project from a template. `None` = cancelled.
 #[tauri::command]
-async fn new_from_template(window: WebviewWindow, id: String) -> Result<Option<ProjectState>, String> {
+async fn new_from_template(
+    window: WebviewWindow,
+    id: String,
+) -> Result<Option<ProjectState>, String> {
     let doc = generation::template_doc(&id)?;
     blocking(move || do_new(&window, doc)).await
 }
@@ -596,10 +656,13 @@ async fn set_seed(
     file: State<'_, GraphFile>,
     seed: String,
 ) -> Result<PipelineGraph, String> {
-    let seed: u64 = seed
-        .trim()
-        .parse()
-        .map_err(|_| format!("`{}` is not a whole number from 0 to {}", seed.trim(), u64::MAX))?;
+    let seed: u64 = seed.trim().parse().map_err(|_| {
+        format!(
+            "`{}` is not a whole number from 0 to {}",
+            seed.trim(),
+            u64::MAX
+        )
+    })?;
 
     edit(&session, &file, move |s| s.set_seed(seed)).await
 }
@@ -647,6 +710,11 @@ pub fn run() {
             generate_chunk,
             sample_world,
             world_point,
+            atlas_status,
+            atlas_grid,
+            atlas_snapshot,
+            atlas_rivers,
+            set_extent,
             pipeline_graph,
             add_node,
             remove_node,

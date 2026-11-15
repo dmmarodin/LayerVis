@@ -33,19 +33,33 @@ let h = chunk.chunk_data().columns[(x, y, 0)][height.slot];   // column export
 // voxel exports: chunk.data()[(x, y, z)].slots[export.slot]
 ```
 
+**Slow worlds (atlas nodes):** build the world inside LayerGen's preparation
+step instead, so the app keeps running meanwhile:
+
+```rust
+let definition = worldgraph::DeferredGraphDefinition::new(doc, config);
+let height = definition.export("height").unwrap().slot;        // known up front
+let point = definition.export_world_slot("height");             // for world.graph().eval
+let progress = definition.progress_handle();                    // atlas progress
+app.add_plugins(LayerGenPlugin::new(definition));
+// once ChunkGenerator::preparation_status() is Ready:
+// generator.shared::<WorldStore>() is the world.
+```
+
 `ChunkManagerPlugin::<Voxel, ColumnData>::with_chunk_data(...)` works the same
 way for managed chunks. `GraphPipeline::generate` is the synchronous variant.
 
 Invalid nodes never fail the build: they are skipped and reported in
 `graph.analysis().nodes` (`status`, `reason`). Check for the exports you need.
 
-## Scopes: world, chunk, voxel
+## Scopes: atlas, world, chunk, voxel
 
 Every node runs at one scope, which is the scope of its outputs (and of its
-sockets: `world`, `column`, `voxel`). They match LayerGen's three levels:
+sockets: `atlas`, `world`, `column`, `voxel`). They match LayerGen's levels:
 
 | scope | runs | LayerGen | data |
 |---|---|---|---|
+| atlas | once, when the world is created, over whole-world grids (simulations) | shared data `D` (`WorldStore::atlas`) | f32 grids, one value per atlas cell |
 | world | once, when the world is created; read-only afterwards | shared data `D` (`WorldStore`) | world slots, a pure function of `(x, y)` |
 | chunk | per chunk, per column | chunk data `C` | column slots |
 | voxel | per chunk, per cell | cells `T` | voxel slots |
@@ -65,6 +79,36 @@ keep the world while only chunk or voxel nodes change. Read it from game
 systems with `ChunkGenerator::shared::<WorldStore>()` and
 `WorldStore::graph().eval(x, y)`.
 
+## Atlas: whole-world simulations
+
+Atlas nodes (`erosion`, `flow`) run once per world over coarse grids: one value
+per atlas cell of `cell_size` x `cell_size` columns (the `extent` block,
+default 16). They are global and eager, because erosion and river networks
+depend on whole drainage basins. Atlas sockets connect only to atlas sockets;
+world values reach them through **`rasterize`** (evaluated at cell centers,
+`supersample`² points per cell) and results go back through **`sample`**
+(`mode` 0 = nearest cell, 1 = bilinear), which is a world node. So the usual
+chain is tectonics → `rasterize` → `erosion` → `sample` → world/chunk nodes.
+
+- Building is the slow part: `WorldStore::for_doc_with(&doc, &config, hooks)`
+  reports progress (`AtlasProgress`) and stops with `ATLAS_CANCELLED` when the
+  `cancelled` hook returns true. `WorldStore::has_atlas_work(&doc)` tells
+  whether a graph has atlas nodes; `WorldStore::placeholder` builds a world
+  with zero-filled grids at once (editors publish it while the real atlas
+  builds).
+- Results are bit-deterministic for the same graph, seed and extent.
+- **Saving:** `world.atlas().write(&mut file)` writes the grids and river lines
+  (versioned little-endian binary). A game loads them with `Atlas::read` and
+  `WorldStore::from_atlas(&doc, &config, &atlas)`, which runs no atlas node and
+  refuses an atlas built from different world nodes, seed or extent.
+- `world.atlas()` also holds river polylines per `flow` node (`rivers()`) and
+  downsampled scrubber frames (`snapshots()`, not saved).
+- Atlas node kinds: `erosion` (uplift + stream-power erosion, Braun & Willett
+  2013; outputs `elevation`, `drainage`, `eroded`), `flow` (`water_level`,
+  `lake_depth`, `discharge`, `river` + river lines); world helper
+  `tectonic_uplift`; adapters `rasterize`, `sample`, `reroute_atlas`. Template
+  `eroded_continent` wires them up.
+
 ## Exports: the contract between graph and game
 
 An **Export** node (`export_column` / `export_voxel`) takes one input and
@@ -73,12 +117,13 @@ unique per graph. Exports cost nothing at runtime: they alias the slot of the
 output wired into them. Rewire or replace upstream nodes freely; game code keeps
 reading the same name.
 
-## File format (`format: 2`)
+## File format (`format: 3`)
 
 ```json
 {
-  "format": 2,
+  "format": 3,
   "seed": 12345,
+  "extent": { "size": [8192, 8192], "depth": 128, "cellSize": 16 },
   "nodes": [
     { "id": "n1", "kind": "tectonics", "params": { "plate_size": 1100, "continents": 1 }, "position": [0, 0] },
     { "id": "n2", "kind": "tectonic_elevation", "position": [340, 0] },
@@ -97,6 +142,11 @@ reading the same name.
 
 (abridged: `tectonic_elevation` has four inputs, all wired from `tectonics`.)
 
+- `extent` (optional): world size in columns (centered on 0, 0), depth in
+  cells and atlas cell size (default 16). Part of the world definition: build
+  the `PipelineConfig` bounds from it (`Extent::origin`, `size`, `depth`);
+  `WorldStore::for_doc` rejects a config that does not match. Without it the
+  config decides the size and the atlas uses 16-column cells.
 - `seed` (u64, default 12345 when missing): the world seed. A JSON number; JS
   readers lose precision above 2^53, so read it with a u64-safe parser.
 - `id`: unique, stable. `enabled` (default true), `position` (layout only),
@@ -115,7 +165,8 @@ reading the same name.
   the old `world` params block (plate size, continents, edge vignette, …) moves
   onto the nodes (a used vignette becomes an `edge_falloff` node behind each
   elevation node), and the block is no longer written. The upgraded graph
-  generates the same world.
+  generates the same world. **2 → 3:** adds the optional `extent` block;
+  nothing to convert.
 
 ## Terrain: world parameters live on world nodes
 

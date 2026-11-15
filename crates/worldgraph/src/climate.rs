@@ -190,7 +190,10 @@ mod tests {
 
             // temperature = equator - pole_drop * |latitude| - lapse * elevation
             let latitude = ((y + 4096) as f64 / 8192.0 * 2.0 - 1.0).abs();
-            assert_eq!(values[temperature], 32.0 - 50.0 * latitude - 0.25 * values[elevation]);
+            assert_eq!(
+                values[temperature],
+                32.0 - 50.0 * latitude - 0.25 * values[elevation]
+            );
 
             if latitude < 0.1 {
                 warm = warm.max(values[temperature]);
@@ -220,10 +223,19 @@ mod tests {
             script: None,
             label: None,
         });
-        for (from, out, input) in [("n2", "elevation", "elevation"), ("n3", "temperature", "temperature")] {
+        for (from, out, input) in [
+            ("n2", "elevation", "elevation"),
+            ("n3", "temperature", "temperature"),
+        ] {
             doc.edges.push(crate::graph::EdgeDoc {
-                from: crate::graph::SocketRef { node: from.into(), socket: out.into() },
-                to: crate::graph::SocketRef { node: "n6".into(), socket: input.into() },
+                from: crate::graph::SocketRef {
+                    node: from.into(),
+                    socket: out.into(),
+                },
+                to: crate::graph::SocketRef {
+                    node: "n6".into(),
+                    socket: input.into(),
+                },
             });
         }
         let world = WorldStore::for_doc(&doc, &config).unwrap();

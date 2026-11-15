@@ -8,6 +8,9 @@
 //!   `tectonics` node is added and wired into them, and the old params move
 //!   onto the nodes. A used edge vignette becomes an `edge_falloff` filter
 //!   node right behind each elevation node.
+//! * **2 → 3**: adds the optional `extent` block (world size, depth, atlas
+//!   cell size). Nothing to convert: a graph without one keeps generating
+//!   the same world.
 
 use std::collections::BTreeMap;
 
@@ -25,6 +28,9 @@ pub fn upgrade(doc: &mut GraphDoc) {
     if doc.format < 2 {
         migrate_v1(doc);
         doc.format = 2;
+    }
+    if doc.format < 3 {
+        doc.format = 3;
     }
 }
 
@@ -78,7 +84,10 @@ fn migrate_v1(doc: &mut GraphDoc) {
         .iter()
         .filter(|node| elevations.contains(&node.id))
         .map(|node| node.position)
-        .fold((f64::MAX, 0.0), |(x, y), p| if p.0 < x { p } else { (x, y) });
+        .fold(
+            (f64::MAX, 0.0),
+            |(x, y), p| if p.0 < x { p } else { (x, y) },
+        );
     let tectonics = doc.next_id();
     doc.nodes.push(node(
         tectonics.clone(),
@@ -112,8 +121,12 @@ fn migrate_v1(doc: &mut GraphDoc) {
                 .into_iter()
                 .filter_map(|(name, old)| legacy.get(old).map(|v| (name.to_owned(), *v))),
             );
-            doc.nodes
-                .push(node(falloff.clone(), "edge_falloff", (position.0, position.1 + 160.0), params));
+            doc.nodes.push(node(
+                falloff.clone(),
+                "edge_falloff",
+                (position.0, position.1 + 160.0),
+                params,
+            ));
 
             // Everything that read the elevation now reads the filtered one.
             for edge in &mut doc.edges {
@@ -148,7 +161,7 @@ mod tests {
     fn elevation_becomes_world_nodes_and_keeps_its_wires() {
         let doc = v1("{}");
 
-        assert_eq!(doc.format, 2);
+        assert_eq!(doc.format, crate::graph::FORMAT);
         assert!(doc.world.is_empty());
         assert_eq!(doc.node("n1").unwrap().kind, "tectonic_elevation");
 
@@ -164,8 +177,14 @@ mod tests {
         }
 
         // Wires out of the old elevation node are untouched.
-        assert!(doc.edges.iter().any(|e| e.from.node == "n1" && e.to.node == "n2"));
-        assert!(doc.edges.iter().any(|e| e.from.node == "n1" && e.to.node == "n4"));
+        assert!(doc
+            .edges
+            .iter()
+            .any(|e| e.from.node == "n1" && e.to.node == "n2"));
+        assert!(doc
+            .edges
+            .iter()
+            .any(|e| e.from.node == "n1" && e.to.node == "n4"));
         assert!(doc.nodes.iter().all(|n| n.kind != "edge_falloff"));
     }
 

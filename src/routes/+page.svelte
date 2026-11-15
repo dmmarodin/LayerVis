@@ -10,6 +10,7 @@
 	import type { OverlayStats } from '$lib/visualizer/overlay';
 	import {
 		addNode,
+		atlasStatus,
 		connect,
 		addFrame,
 		disconnectMany,
@@ -27,6 +28,7 @@
 		removeItems,
 		saveProject,
 		saveProjectAs,
+		setExtent,
 		setSeed,
 		undo,
 		updateFrame,
@@ -37,6 +39,7 @@
 		setParam,
 		updateScript,
 		worldInfo,
+		type AtlasStatus,
 		type PipelineGraph as Graph,
 		type ProjectState,
 		type SocketRef,
@@ -86,6 +89,52 @@
 	let hover: HoverInfo | null = null;
 	let chunkStatus = 'Connecting to backend…';
 	let worldStatus = '';
+	let atlasState: AtlasStatus | null = null;
+	let atlasWatching = false;
+
+	const ATLAS_POLL_MS = 250;
+
+	/**
+	 * While the published world waits for its atlas (built in the
+	 * background), polls the build and restarts the map once the real world
+	 * is published. One loop at a time; edits that start a new build keep it
+	 * going.
+	 */
+	async function watchAtlas() {
+		if (atlasWatching || !world?.atlas.pending) return;
+		atlasWatching = true;
+
+		try {
+			while (world?.atlas.pending) {
+				await new Promise((resolve) => setTimeout(resolve, ATLAS_POLL_MS));
+				atlasState = await atlasStatus();
+				if (atlasState.state === 'building') continue;
+
+				const next = await worldInfo();
+				if (!next.atlas.pending) {
+					world = next;
+					visualizer?.start(world, callbacks);
+				} else if (atlasState.state === 'failed') {
+					break; // stays a placeholder until the next edit
+				}
+			}
+		} catch (error) {
+			atlasState = { state: 'failed', error: String(error) };
+		} finally {
+			atlasWatching = false;
+			if (atlasState?.state !== 'failed') atlasState = null;
+		}
+	}
+
+	function describeAtlas(state: AtlasStatus | null): string {
+		if (!state) return world?.atlas.pending ? 'Atlas: building…' : '';
+		if (state.state === 'failed') return `Atlas build failed: ${state.error}`;
+		if (state.state === 'building' && state.total > 0) {
+			const percent = Math.round(state.fraction * 100);
+			return `Atlas: ${state.node} (${state.index + 1}/${state.total}) ${percent}%`;
+		}
+		return state.state === 'building' ? 'Atlas: starting…' : '';
+	}
 
 	const callbacks: VisualizerCallbacks = {
 		onStream: (stats) => (chunkStatus = describeChunks(stats)),
@@ -110,6 +159,7 @@
 				listTemplates()
 			]);
 			visualizer.start(world, callbacks);
+			watchAtlas();
 		} catch (error) {
 			chunkStatus = `Backend unavailable: ${error}`;
 		}
@@ -142,6 +192,8 @@
 		}
 		world = await worldInfo();
 		visualizer?.start(world, callbacks);
+		if (world.atlas.pending && atlasState?.state === 'failed') atlasState = null;
+		watchAtlas();
 		await refreshProject();
 	}
 
@@ -406,10 +458,14 @@
 		{hover}
 		{focusField}
 		{stageFields}
-		statusLines={[chunkStatus, worldStatus].filter(Boolean)}
+		statusLines={[describeAtlas(atlasState), chunkStatus, worldStatus].filter(Boolean)}
+		{atlasState}
 		{onViewChange}
 		busy={graphBusy}
 		onSeed={(seed) => editGraph(() => setSeed(seed))}
+		onExtent={(extent) => editGraph(() => setExtent(extent))}
+		onSnapshot={(index) => visualizer?.setSnapshot(index)}
+		onRivers={(visible) => visualizer?.setRivers(visible)}
 		onGoTo={(x, y) => visualizer?.goTo(x, y)}
 		onFitWorld={() => visualizer?.fitWorld()}
 		getDataRange={() => visualizer?.dataRange() ?? null}
@@ -420,6 +476,13 @@
 			<button class="graph-toggle" on:click={() => (showGraph = !showGraph)}>
 				{showGraph ? 'Hide graph' : 'Show graph'}
 			</button>
+
+			{#if world?.atlas.pending}
+				<div class="atlas-banner">
+					{describeAtlas(atlasState) || 'Atlas: building…'}
+					<span class="muted">· chunks and world views wait for it</span>
+				</div>
+			{/if}
 
 			{#if selected && selectedOrder !== null}
 				<div class="stage-banner">
@@ -531,8 +594,24 @@
 		font-size: 12px;
 	}
 
-	.stage-banner .muted {
+	.stage-banner .muted,
+	.atlas-banner .muted {
 		color: #8a8fa6;
+	}
+
+	.atlas-banner {
+		position: absolute;
+		bottom: 10px;
+		left: 50%;
+		transform: translateX(-50%);
+		z-index: 1;
+		padding: 4px 12px;
+		border-radius: 6px;
+		border: 1px solid #4fd1b5;
+		background: #1b2a2ae6;
+		color: #c3e8df;
+		font-size: 12px;
+		white-space: nowrap;
 	}
 
 	.stage-banner button {

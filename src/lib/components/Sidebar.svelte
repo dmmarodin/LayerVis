@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { FieldDef, WorldInfo } from '$lib/bridge';
+	import type { AtlasStatus, Extent, FieldDef, WorldInfo } from '$lib/bridge';
 	import {
 		RAMPS,
 		rampGradient,
@@ -26,6 +26,13 @@
 	export let getDataRange: () => [number, number] | null = () => null;
 	/** Disables the seed controls while a graph edit is running. */
 	export let busy = false;
+	/** Background atlas build, while one runs (or failed). */
+	export let atlasState: AtlasStatus | null = null;
+	/** Applies a new world size / depth / atlas cell size. */
+	export let onExtent: (extent: Extent) => Promise<void> | void = () => {};
+	/** Shows a scrubber frame (index into `world.atlas.snapshots`), or null for the live view. */
+	export let onSnapshot: (index: number | null) => void = () => {};
+	export let onRivers: (visible: boolean) => void = () => {};
 
 	let focusedNonce = 0;
 	$: if (world && focusField && focusField.nonce !== focusedNonce) {
@@ -52,7 +59,12 @@
 	}
 
 	function previousKey(previousWorld: WorldInfo): string | undefined {
-		const list = source === 'column' ? previousWorld.columnFields : previousWorld.worldFields;
+		const list =
+			source === 'column'
+				? previousWorld.columnFields
+				: source === 'atlas'
+					? previousWorld.atlas.fields
+					: previousWorld.worldFields;
 		return list[field]?.key;
 	}
 
@@ -76,6 +88,7 @@
 
 	function fieldsOf(scope: FieldSource): FieldDef[] {
 		if (!world) return [];
+		if (scope === 'atlas') return world.atlas.fields;
 		return scope === 'column' ? world.columnFields : world.worldFields;
 	}
 
@@ -195,6 +208,53 @@
 	$: landPercent = stats ? Math.round(stats.landFraction * 100) : 0;
 	$: edgeOcean = !!stats && stats.edgeLand === 0;
 
+	// --- Extent ---------------------------------------------------------------
+
+	let extentWidth = 0;
+	let extentHeight = 0;
+	let extentDepth = 0;
+	let extentCell = 0;
+	let extentFor: WorldInfo | null = null;
+
+	$: if (world && world !== extentFor) {
+		extentFor = world;
+		[extentWidth, extentHeight, extentDepth] = world.dimensions;
+		extentCell = world.atlas.cellSize;
+	}
+
+	$: extentChanged =
+		!!world &&
+		(extentWidth !== world.dimensions[0] ||
+			extentHeight !== world.dimensions[1] ||
+			extentDepth !== world.dimensions[2] ||
+			extentCell !== world.atlas.cellSize);
+
+	function applyExtent() {
+		onExtent({
+			size: [Math.round(extentWidth), Math.round(extentHeight)],
+			depth: Math.round(extentDepth),
+			cellSize: Math.round(extentCell)
+		});
+	}
+
+	// --- Atlas: rivers and simulation frames --------------------------------
+
+	let showRivers = false;
+	$: onRivers(showRivers);
+
+	/** Nodes with scrubber frames, and the selected one. */
+	$: frameNodes = [...new Set(world?.atlas.snapshots.map((s) => s.node) ?? [])];
+	let frameNode = '';
+	let frameIndex = 0;
+	let showFrame = false;
+	$: if (frameNodes.length && !frameNodes.includes(frameNode)) frameNode = frameNodes[frameNodes.length - 1];
+	$: nodeFrames = (world?.atlas.snapshots ?? [])
+		.map((snapshot, index) => ({ ...snapshot, index }))
+		.filter((snapshot) => snapshot.node === frameNode);
+	$: if (frameIndex >= nodeFrames.length) frameIndex = Math.max(0, nodeFrames.length - 1);
+	$: currentFrame = nodeFrames[frameIndex];
+	$: onSnapshot(showFrame && currentFrame ? currentFrame.index : null);
+
 	// --- Navigation ---------------------------------------------------------
 
 	let goX = 0;
@@ -251,12 +311,35 @@
 				{/if}
 			</div>
 
+			<div class="field">
+				<span class="label">Size · depth · atlas cell (columns)</span>
+				<div class="row">
+					<input class="mono" type="number" min="256" step="256" title="Width" disabled={busy} bind:value={extentWidth} />
+					<input class="mono" type="number" min="256" step="256" title="Height" disabled={busy} bind:value={extentHeight} />
+				</div>
+				<div class="row">
+					<input class="mono" type="number" min="32" step="32" title="Depth (cells)" disabled={busy} bind:value={extentDepth} />
+					<input class="mono" type="number" min="1" title="Atlas cell size (columns)" disabled={busy} bind:value={extentCell} />
+				</div>
+				{#if extentChanged}
+					<button class="small" disabled={busy} on:click={applyExtent}>Apply size (new world)</button>
+				{/if}
+			</div>
+
 			<dl class="facts">
-				<dt>Size</dt>
-				<dd>{world.dimensions[0]} × {world.dimensions[1]}</dd>
 				<dt>Chunk</dt>
 				<dd>{world.chunkSize.join(' × ')}</dd>
+				{#if world.atlas.fields.length}
+					<dt>Atlas</dt>
+					<dd>{world.atlas.grid[0]} × {world.atlas.grid[1]} cells</dd>
+				{/if}
 			</dl>
+
+			{#if atlasState?.state === 'failed'}
+				<p class="error">Atlas build failed: {atlasState.error}</p>
+			{:else if world.atlas.pending}
+				<p class="hint">Building the atlas…</p>
+			{/if}
 
 			{#if stats && world.worldFields.length}
 				<p class="stats" class:warn={!edgeOcean}>
@@ -287,8 +370,21 @@
 							<option value={`world:${index}`}>{label(def)}</option>
 						{/each}
 					</optgroup>
+					{#if world.atlas.fields.length}
+						<optgroup label="Atlas grids">
+							{#each world.atlas.fields as def, index}
+								<option value={`atlas:${index}`}>{label(def)}</option>
+							{/each}
+						</optgroup>
+					{/if}
 				</select>
 			</div>
+
+			{#if world.atlas.fields.length}
+				<label class="check">
+					<input type="checkbox" bind:checked={showRivers} /> River lines (flow nodes)
+				</label>
+			{/if}
 
 			<div class="field">
 				<label for="ramp">Ramp</label>
@@ -337,6 +433,33 @@
 				</button>
 			</div>
 		</SidebarSection>
+
+		{#if frameNodes.length}
+			<SidebarSection id="simulation" title="Simulation">
+				<div class="field">
+					<label for="frame-node">Node</label>
+					<select id="frame-node" bind:value={frameNode}>
+						{#each frameNodes as node}
+							<option value={node}>{node}</option>
+						{/each}
+					</select>
+				</div>
+				<label class="check">
+					<input type="checkbox" bind:checked={showFrame} /> Show frame (uses the View ramp)
+				</label>
+				<div class="field">
+					<label for="frame">Frame {frameIndex + 1}/{nodeFrames.length}: {currentFrame?.label ?? ''}</label>
+					<input
+						id="frame"
+						type="range"
+						min="0"
+						max={Math.max(0, nodeFrames.length - 1)}
+						bind:value={frameIndex}
+						disabled={!showFrame}
+					/>
+				</div>
+			</SidebarSection>
+		{/if}
 
 		<SidebarSection id="navigate" title="Navigate">
 			<div class="row">
@@ -396,6 +519,11 @@
 						<dt title="{def.nodeLabel} {def.node}">{def.name} <small>{def.node}</small></dt>
 						<dd>{computed(def.key) ? format(hover.column?.[index]) : 'not yet'}</dd>
 					{/each}
+
+					{#if hover.atlasValue !== null}
+						<dt>atlas <small>shown</small></dt>
+						<dd>{format(hover.atlasValue)}</dd>
+					{/if}
 
 					{#if hover.worldValues}
 						{#each world.worldFields as def, index}
@@ -538,6 +666,22 @@
 
 	.stats {
 		font-size: 11px;
+	}
+
+	.label {
+		font-size: 11px;
+		opacity: 0.8;
+	}
+
+	.check {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		font-size: 12px;
+
+		input {
+			width: auto;
+		}
 	}
 
 	.stats.warn {

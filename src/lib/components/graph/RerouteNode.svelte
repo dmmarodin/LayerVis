@@ -52,6 +52,14 @@
 		border-color: #b58cf0;
 	}
 
+	.reroute :global(.handle.atlas) {
+		background: #4fd1b5;
+	}
+
+	.reroute.atlas {
+		border-color: #4fd1b5;
+	}
+
 	.reroute :global(.handle.voxel) {
 		background: #e0a24f;
 	}

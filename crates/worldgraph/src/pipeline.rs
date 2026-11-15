@@ -26,6 +26,10 @@ use serde::Serialize;
 #[cfg(feature = "scripting")]
 use crate::script::{ScriptDef, ScriptStep};
 use crate::{
+    atlas::{
+        Atlas, AtlasContext, AtlasGrid, AtlasHooks, AtlasIo, AtlasRun, BoxedAtlasStage, SampleStep,
+        ATLAS_SLOTS,
+    },
     can_connect,
     graph::{id_order, GraphDoc, NodeDoc, SocketRef},
     steps,
@@ -185,6 +189,13 @@ pub enum Build {
     /// World-scope node: built once when the world is created, then evaluated
     /// per sample point. Inputs and outputs are world slots.
     World(fn(&Bindings, &Params, &WorldBuildContext) -> Result<BoxedWorldStep, String>),
+    /// Atlas-scope node: built and run once when the world is created, over
+    /// whole grids. Inputs and outputs are atlas slots.
+    Atlas(fn(&Bindings, &Params, &AtlasContext) -> Result<BoxedAtlasStage, String>),
+    /// world -> atlas adapter (`rasterize`): one world input, one atlas output.
+    Rasterize,
+    /// atlas -> world adapter (`sample`): one atlas input, one world output.
+    Sample,
 }
 
 /// A registered built-in node kind.
@@ -336,6 +347,11 @@ impl Schema {
     /// Outputs of world-scope nodes (slots index `WorldGraph::eval`).
     pub fn world_fields(&self) -> Vec<FieldDef> {
         self.scoped(FieldScope::World)
+    }
+
+    /// Outputs of atlas-scope nodes (slots index the atlas grids).
+    pub fn atlas_fields(&self) -> Vec<FieldDef> {
+        self.scoped(FieldScope::Atlas)
     }
 
     fn scoped(&self, scope: FieldScope) -> Vec<FieldDef> {
@@ -541,11 +557,12 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
         });
 
         let valid = match (from, to, out_scope, in_scope) {
-            (Some(f), Some(t), Some(a), Some(b)) if can_connect(a, b) && f != t => !incoming
-                .contains_key(&(t, edge.to.socket.clone()))
-                && incoming
-                    .insert((t, edge.to.socket.clone()), (f, edge.from.socket.clone()))
-                    .is_none(),
+            (Some(f), Some(t), Some(a), Some(b)) if can_connect(a, b) && f != t => {
+                !incoming.contains_key(&(t, edge.to.socket.clone()))
+                    && incoming
+                        .insert((t, edge.to.socket.clone()), (f, edge.from.socket.clone()))
+                        .is_none()
+            }
             _ => false,
         };
 
@@ -567,7 +584,8 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
     let mut runnable = vec![false; n];
     let mut order = Vec::new();
     let mut slots: HashMap<(usize, String), usize> = HashMap::new();
-    let (mut next_column, mut next_voxel, mut next_world) = (0usize, 0usize, 0usize);
+    let (mut next_column, mut next_voxel, mut next_world, mut next_atlas) =
+        (0usize, 0usize, 0usize, 0usize);
     let mut export_names: HashMap<String, usize> = HashMap::new();
     // A chunk-scope input wired to a world output reads a column slot that
     // the world graph fills per column (one per distinct world output).
@@ -602,7 +620,10 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
         if contract(i).is_some_and(|c| c.export) {
             let name = export_name(&doc.nodes[i]);
             if let Some(&owner) = export_names.get(&name) {
-                reasons[i] = Some(format!("export name `{name}` is already used by {}", label(owner)));
+                reasons[i] = Some(format!(
+                    "export name `{name}` is already used by {}",
+                    label(owner)
+                ));
                 continue;
             }
             export_names.insert(name, i);
@@ -626,18 +647,21 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
         // Reroutes take no slot of their own: their output is the input's slot.
         let outputs: &[FieldSpec] = if c.alias { &[] } else { &c.outputs };
         let count = |scope| outputs.iter().filter(|o| o.scope == scope).count();
-        let (columns, voxels, worlds) = (
+        let (columns, voxels, worlds, atlases) = (
             count(FieldScope::Column) + new_samples.len(),
             count(FieldScope::Voxel),
             count(FieldScope::World),
+            count(FieldScope::Atlas),
         );
 
         if next_column + columns > COLUMN_SLOTS
             || next_voxel + voxels > VOXEL_SLOTS
             || next_world + worlds > WORLD_SLOTS
+            || next_atlas + atlases > ATLAS_SLOTS
         {
             reasons[i] = Some(
-                "no free output slots (raise COLUMN_SLOTS/VOXEL_SLOTS/WORLD_SLOTS)".into(),
+                "no free output slots (raise COLUMN_SLOTS/VOXEL_SLOTS/WORLD_SLOTS/ATLAS_SLOTS)"
+                    .into(),
             );
             continue;
         }
@@ -673,6 +697,7 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
                 FieldScope::Voxel => &mut next_voxel,
                 FieldScope::Column => &mut next_column,
                 FieldScope::World => &mut next_world,
+                FieldScope::Atlas => &mut next_atlas,
             };
             slots.insert((i, output.name.to_string()), *counter);
             *counter += 1;
@@ -682,8 +707,9 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
         order.push(i);
     }
 
-    // World nodes run once per world, not per chunk: they come first.
-    let is_world = |i: usize| contract(i).is_some_and(|c| c.scope() == FieldScope::World);
+    // World and atlas nodes run once per world, not per chunk: they come
+    // first (in topological order among themselves).
+    let is_world = |i: usize| contract(i).is_some_and(|c| c.scope().is_world_stage());
     order.sort_by_key(|&i| !is_world(i));
 
     // 4. Explain eligible nodes that did not run.
@@ -719,10 +745,14 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
             if reasons[i].is_some() {
                 continue;
             }
-            let blocked = contract(i).expect("eligible").inputs.iter().find_map(|input| {
-                let (source, _) = incoming.get(&(i, input.name.to_string()))?;
-                reasons[*source].is_some().then_some(*source)
-            });
+            let blocked = contract(i)
+                .expect("eligible")
+                .inputs
+                .iter()
+                .find_map(|input| {
+                    let (source, _) = incoming.get(&(i, input.name.to_string()))?;
+                    reasons[*source].is_some().then_some(*source)
+                });
             if let Some(source) = blocked {
                 reasons[i] = Some(format!("depends on blocked node {}", label(source)));
                 changed = true;
@@ -806,7 +836,10 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
             // Re-processing outputs inherit display from their input's source.
             let source_field = output.display_from.as_ref().and_then(|input| {
                 let (source, socket) = origin(incoming.get(&(i, input.to_string()))?.clone());
-                fields.iter().find(|f| f.key == key(source, &socket)).cloned()
+                fields
+                    .iter()
+                    .find(|f| f.key == key(source, &socket))
+                    .cloned()
             });
 
             fields.push(FieldDef {
@@ -816,7 +849,9 @@ pub fn analyze(doc: &GraphDoc, resolved: &[ResolvedNode]) -> Analysis {
                 name: output.name.clone(),
                 scope: output.scope,
                 slot: slots[&(i, output.name.to_string())],
-                unit: source_field.as_ref().map_or(output.unit.clone(), |f| f.unit.clone()),
+                unit: source_field
+                    .as_ref()
+                    .map_or(output.unit.clone(), |f| f.unit.clone()),
                 min: source_field.as_ref().map_or(output.min, |f| f.min),
                 max: source_field.as_ref().map_or(output.max, |f| f.max),
                 ramp: source_field.map_or(output.ramp.clone(), |f| f.ramp),
@@ -1049,7 +1084,7 @@ impl DynPipeline {
                 !resolved[analysis.order[position]]
                     .contract
                     .as_ref()
-                    .is_ok_and(|c| c.export || c.alias || c.scope() == FieldScope::World)
+                    .is_ok_and(|c| c.export || c.alias || c.scope().is_world_stage())
             })
             .map(|position| {
                 let i = analysis.order[position];
@@ -1094,7 +1129,7 @@ impl DynPipeline {
                 .as_ref()
                 .is_ok_and(|c| {
                     c.alias
-                        || c.scope() == FieldScope::World
+                        || c.scope().is_world_stage()
                         || c.outputs.iter().all(|o| o.scope == FieldScope::Column)
                 })
         })
@@ -1148,31 +1183,278 @@ impl ChunkStep<Voxel, ColumnData, WorldStore> for WorldSampleStep {
     }
 }
 
-/// Compiles the runnable world-scope nodes of an analyzed graph.
-pub fn build_world_graph(
+/// Where the atlas grids of a world build come from.
+#[derive(Clone, Copy)]
+pub enum AtlasSource<'a> {
+    /// Run the atlas nodes (with progress / cancellation hooks).
+    Compute(AtlasHooks<'a>),
+    /// A saved atlas: no atlas node runs, the grids must all be there.
+    Stored(&'a Atlas),
+    /// Zero-filled grids, nothing computed: a structurally complete world
+    /// for editors while the real atlas builds in the background.
+    Placeholder,
+}
+
+/// Compiles the runnable world-scope nodes of an analyzed graph and runs its
+/// atlas nodes, in graph order (or takes their grids from `source`).
+pub fn build_world_stage(
     doc: &GraphDoc,
     resolved: &[ResolvedNode],
     analysis: &Analysis,
     context: &WorldBuildContext,
-) -> Result<WorldGraph, String> {
-    let mut steps = Vec::new();
+    atlas_context: AtlasContext,
+    source: AtlasSource<'_>,
+) -> Result<(WorldGraph, Atlas), String> {
+    let implementation = |i: usize| match &resolved[i].implementation {
+        Some(Implementation::Builtin(build)) => Some(*build),
+        _ => None,
+    };
+    let total = analysis
+        .order
+        .iter()
+        .filter(|&&i| matches!(implementation(i), Some(Build::Atlas(_) | Build::Rasterize)))
+        .count();
 
-    for &i in &analysis.order {
-        let node = &resolved[i];
-        let Some(Implementation::Builtin(Build::World(build))) = &node.implementation else {
-            continue;
-        };
-        let bindings = analysis.bindings[i]
-            .as_ref()
-            .ok_or_else(|| "node is not runnable".to_owned())?;
+    let mut steps: Vec<(usize, BoxedWorldStep)> = Vec::new();
+    let mut atlas = Atlas::empty(atlas_context);
+    let hooks = match source {
+        AtlasSource::Compute(hooks) => hooks,
+        _ => AtlasHooks::default(),
+    };
+    let stored = match source {
+        AtlasSource::Stored(atlas) => Some(atlas),
+        _ => None,
+    };
+    let mut run = AtlasRun::new(hooks, total);
+    let mut done = 0;
 
-        steps.push(
-            build(bindings, &node.params, context)
-                .map_err(|error| format!("{}: {error}", doc.nodes[i].id))?,
-        );
+    if let Some(stored) = stored {
+        if stored.context() != &atlas_context {
+            return Err("the saved atlas belongs to a different world size or seed".to_owned());
+        }
+        atlas.grids = stored.grids.clone();
+        atlas.rivers = stored.rivers.clone();
     }
 
-    Ok(WorldGraph { steps })
+    for &i in &analysis.order {
+        let Some(build) = implementation(i) else {
+            continue;
+        };
+        let id = &doc.nodes[i].id;
+        let bindings = || {
+            analysis.bindings[i]
+                .as_ref()
+                .ok_or_else(|| format!("{id}: node is not runnable"))
+        };
+        let in_slot = |name: &str| bindings()?.input(name).map_err(|e| format!("{id}: {e}"));
+        let out_slot = |name: &str| bindings()?.output(name).map_err(|e| format!("{id}: {e}"));
+        let outputs = || {
+            resolved[i]
+                .contract
+                .as_ref()
+                .map(|c| c.outputs.clone())
+                .map_err(Clone::clone)
+        };
+        let params = &resolved[i].params;
+
+        match build {
+            Build::World(build) => {
+                let step = build(bindings()?, params, context).map_err(|e| format!("{id}: {e}"))?;
+                steps.push((i, step));
+            }
+            Build::Sample => {
+                let grid = atlas
+                    .grids
+                    .get(in_slot("in")?)
+                    .cloned()
+                    .flatten()
+                    .ok_or_else(|| format!("{id}: its atlas input has no grid"))?;
+                steps.push((
+                    i,
+                    Box::new(SampleStep {
+                        grid,
+                        context: atlas_context,
+                        out: out_slot("out")?,
+                        bilinear: params.get("mode") >= 0.5,
+                    }),
+                ));
+            }
+            Build::Rasterize | Build::Atlas(_) if matches!(source, AtlasSource::Placeholder) => {
+                for output in outputs()? {
+                    store_grid(
+                        &mut atlas.grids,
+                        out_slot(&output.name)?,
+                        atlas_context.grid(0.0),
+                    );
+                }
+            }
+            Build::Rasterize | Build::Atlas(_) if stored.is_some() => {
+                // A saved atlas: check its grids are there instead of computing them.
+                for output in outputs()? {
+                    if atlas.grid(out_slot(&output.name)?).is_none() {
+                        return Err(format!(
+                            "{id}: the saved atlas has no grid for `{}`",
+                            output.name
+                        ));
+                    }
+                }
+            }
+            Build::Rasterize => {
+                run.begin(id, done);
+                let ancestors = world_ancestors(analysis, doc, i);
+                let chosen: Vec<&BoxedWorldStep> = steps
+                    .iter()
+                    .filter(|(node, _)| ancestors.contains(node))
+                    .map(|(_, step)| step)
+                    .collect();
+                let grid = rasterize(
+                    &chosen,
+                    in_slot("in")?,
+                    params.get("supersample").round().max(1.0) as u32,
+                    &atlas_context,
+                    &mut run,
+                )
+                .map_err(|e| format!("{id}: {e}"))?;
+                store_grid(&mut atlas.grids, out_slot("out")?, grid);
+                done += 1;
+                run.progress(1.0);
+            }
+            Build::Atlas(build) => {
+                run.begin(id, done);
+                let stage =
+                    build(bindings()?, params, &atlas_context).map_err(|e| format!("{id}: {e}"))?;
+                let mut io = AtlasIo::new(&atlas_context, &atlas.grids);
+                stage
+                    .run(&mut io, &mut run)
+                    .map_err(|e| format!("{id}: {e}"))?;
+                let (written, rivers) = io.finish();
+
+                for output in outputs()? {
+                    let slot = out_slot(&output.name)?;
+                    if !written.iter().any(|(s, _)| *s == slot) {
+                        return Err(format!("{id}: output `{}` was not written", output.name));
+                    }
+                }
+                for (slot, grid) in written {
+                    store_grid(&mut atlas.grids, slot, grid);
+                }
+                if let Some(rivers) = rivers {
+                    atlas.rivers.push((id.clone(), rivers));
+                }
+                done += 1;
+                run.progress(1.0);
+            }
+            _ => {}
+        }
+    }
+
+    atlas.snapshots = run.into_snapshots();
+    Ok((
+        WorldGraph {
+            steps: steps.into_iter().map(|(_, step)| step).collect(),
+        },
+        atlas,
+    ))
+}
+
+fn store_grid(grids: &mut Vec<Option<Arc<AtlasGrid>>>, slot: usize, grid: AtlasGrid) {
+    if grids.len() <= slot {
+        grids.resize(slot + 1, None);
+    }
+    grids[slot] = Some(Arc::new(grid));
+}
+
+/// Runnable nodes upstream of node `i` (through valid edges).
+fn world_ancestors(analysis: &Analysis, doc: &GraphDoc, i: usize) -> Vec<usize> {
+    let index: HashMap<&str, usize> = doc
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(k, node)| (node.id.as_str(), k))
+        .collect();
+    let mut found = Vec::new();
+    let mut stack = vec![i];
+
+    while let Some(node) = stack.pop() {
+        let id = &doc.nodes[node].id;
+        for edge in analysis
+            .edges
+            .iter()
+            .filter(|e| e.valid && &e.to.node == id)
+        {
+            if let Some(&source) = index.get(edge.from.node.as_str()) {
+                if !found.contains(&source) {
+                    found.push(source);
+                    stack.push(source);
+                }
+            }
+        }
+    }
+
+    found
+}
+
+/// Evaluates world steps at every atlas cell (averaging `supersample`^2
+/// points per cell), with rows split across threads.
+fn rasterize(
+    steps: &[&BoxedWorldStep],
+    slot: usize,
+    supersample: u32,
+    context: &AtlasContext,
+    run: &mut AtlasRun<'_>,
+) -> Result<AtlasGrid, String> {
+    let (width, height) = context.grid;
+    let row_len = width as usize;
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(16);
+    let batch_rows = threads * 4;
+    let mut values = vec![0.0f32; row_len * height as usize];
+    let s = f64::from(supersample);
+
+    let eval_row = |cy: u32, row: &mut [f32]| {
+        for (cx, value) in row.iter_mut().enumerate() {
+            let mut sum = 0.0;
+            for sy in 0..supersample {
+                for sx in 0..supersample {
+                    let (x, y) = context.cell_point(
+                        cx as u32,
+                        cy,
+                        (f64::from(sx) + 0.5) / s,
+                        (f64::from(sy) + 0.5) / s,
+                    );
+                    let mut slots = [0.0; WORLD_SLOTS];
+                    for step in steps {
+                        step.run(x, y, &mut slots);
+                    }
+                    sum += slots[slot];
+                }
+            }
+            *value = (sum / (s * s)) as f32;
+        }
+    };
+
+    let mut first = 0usize;
+    for rows in values.chunks_mut(row_len * batch_rows) {
+        run.check()?;
+        let rows_here = rows.len() / row_len;
+        let per_thread = rows_here.div_ceil(threads).max(1);
+        std::thread::scope(|scope| {
+            for (k, block) in rows.chunks_mut(row_len * per_thread).enumerate() {
+                let start = first + k * per_thread;
+                let eval_row = &eval_row;
+                scope.spawn(move || {
+                    for (r, row) in block.chunks_mut(row_len).enumerate() {
+                        eval_row((start + r) as u32, row);
+                    }
+                });
+            }
+        });
+        first += rows_here;
+        run.progress(first as f64 / f64::from(height));
+    }
+
+    AtlasGrid::from_values(width, height, values)
 }
 
 /// `world_signature` of a graph without world nodes.
@@ -1191,7 +1473,7 @@ pub fn world_signature(doc: &GraphDoc) -> String {
             resolved
                 .contract
                 .as_ref()
-                .is_ok_and(|c| c.scope() == FieldScope::World)
+                .is_ok_and(|c| c.scope().is_world_stage())
         })
         .collect();
 
@@ -1205,7 +1487,13 @@ pub fn world_signature(doc: &GraphDoc) -> String {
         .filter(|edge| world_nodes.iter().any(|(node, _)| node.id == edge.to.node))
         .collect();
 
-    serde_json::to_string(&(nodes, edges)).expect("signature values always serialize")
+    // The extent decides the world size and atlas grid: part of the world.
+    // Format 2 graphs (no extent) keep their old signature.
+    match &doc.extent {
+        None => serde_json::to_string(&(nodes, edges)),
+        Some(extent) => serde_json::to_string(&(nodes, edges, extent)),
+    }
+    .expect("signature values always serialize")
 }
 
 /// Builds the neighborhood node at `order[position]`, timed in that slot.
@@ -1312,6 +1600,7 @@ pub(crate) mod tests {
             seed: 1,
             frames: Vec::new(),
             world: Default::default(),
+            extent: None,
             nodes,
             edges,
         }
@@ -1323,14 +1612,22 @@ pub(crate) mod tests {
     #[test]
     fn order_follows_edges_not_list_or_layout() {
         let graph = doc(
-            vec![node("n3", "export_column"), node("n2", "solid"), node("n1", "world_noise")],
+            vec![
+                node("n3", "export_column"),
+                node("n2", "solid"),
+                node("n1", "world_noise"),
+            ],
             vec![
                 edge("n1", "noise", "n3", "value"),
                 edge("n1", "noise", "n2", "elevation"),
             ],
         );
         let analysis = run(&graph);
-        let ids: Vec<_> = analysis.order.iter().map(|&i| graph.nodes[i].id.as_str()).collect();
+        let ids: Vec<_> = analysis
+            .order
+            .iter()
+            .map(|&i| graph.nodes[i].id.as_str())
+            .collect();
 
         assert_eq!(ids, ["n1", "n2", "n3"]);
         assert_eq!(analysis.schema.slot("n1.noise"), Ok(0)); // world slots
@@ -1343,7 +1640,11 @@ pub(crate) mod tests {
     fn reprocessing_gets_its_own_slot_and_inherits_display() {
         // noise → smooth → an export reads the smoothed value.
         let graph = doc(
-            vec![node("n1", "world_noise"), node("n2", "smooth"), node("n3", "export_column")],
+            vec![
+                node("n1", "world_noise"),
+                node("n2", "smooth"),
+                node("n3", "export_column"),
+            ],
             vec![
                 edge("n1", "noise", "n2", "value"),
                 edge("n2", "smoothed", "n3", "value"),
@@ -1389,8 +1690,16 @@ pub(crate) mod tests {
         let analysis = run(&graph);
 
         assert!(analysis.order.is_empty());
-        assert!(report(&analysis, "n2").reason.as_deref().unwrap().contains("disabled node"));
-        assert!(report(&analysis, "n3").reason.as_deref().unwrap().contains("disabled node"));
+        assert!(report(&analysis, "n2")
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("disabled node"));
+        assert!(report(&analysis, "n3")
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("disabled node"));
         assert_eq!(
             report(&analysis, "n4").reason.as_deref(),
             Some("input `elevation` is not connected")
@@ -1400,7 +1709,11 @@ pub(crate) mod tests {
     #[test]
     fn invalid_edges_are_reported_and_unknown_kinds_block() {
         let graph = doc(
-            vec![node("n1", "world_noise"), node("n2", "solid"), node("n3", "mystery")],
+            vec![
+                node("n1", "world_noise"),
+                node("n2", "solid"),
+                node("n3", "mystery"),
+            ],
             vec![
                 edge("n1", "nope", "n2", "elevation"), // dangling socket
                 edge("n9", "x", "n2", "elevation"),    // dangling node
@@ -1409,7 +1722,11 @@ pub(crate) mod tests {
         let analysis = run(&graph);
 
         assert!(analysis.edges.iter().all(|e| !e.valid));
-        assert!(report(&analysis, "n2").reason.as_deref().unwrap().contains("not connected"));
+        assert!(report(&analysis, "n2")
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("not connected"));
         assert!(report(&analysis, "n3")
             .reason
             .as_deref()
@@ -1432,7 +1749,11 @@ pub(crate) mod tests {
     #[test]
     fn second_neighborhood_node_is_blocked() {
         let graph = doc(
-            vec![node("n1", "world_noise"), node("n2", "slope"), node("n3", "smooth")],
+            vec![
+                node("n1", "world_noise"),
+                node("n2", "slope"),
+                node("n3", "smooth"),
+            ],
             vec![
                 edge("n1", "noise", "n2", "elevation"),
                 edge("n1", "noise", "n3", "value"),
@@ -1480,7 +1801,10 @@ pub(crate) mod tests {
 
         assert_eq!(names, ["height", DEFAULT_EXPORT_NAME]);
         // A world value exported to the game is its sampled column slot.
-        assert_eq!(analysis.exports[0].slot, analysis.world_samples[0].column_slot);
+        assert_eq!(
+            analysis.exports[0].slot,
+            analysis.world_samples[0].column_slot
+        );
         assert_eq!(analysis.exports[0].field, "n1.noise");
         assert!(report(&analysis, "n3")
             .reason
@@ -1527,12 +1851,24 @@ pub(crate) mod tests {
         assert!(["n2", "n3", "n7"]
             .iter()
             .all(|id| report(&analysis, id).status == NodeStatus::Active));
-        let keys: Vec<_> = analysis.schema.fields.iter().map(|f| f.key.as_str()).collect();
+        let keys: Vec<_> = analysis
+            .schema
+            .fields
+            .iter()
+            .map(|f| f.key.as_str())
+            .collect();
         assert_eq!(keys, ["n1.noise", "n6.solid"]);
-        assert_eq!(analysis.world_samples.len(), 1, "one sampled copy serves every reader");
+        assert_eq!(
+            analysis.world_samples.len(),
+            1,
+            "one sampled copy serves every reader"
+        );
 
         // Consumers read the sampled slot; exports report the real producer.
-        assert_eq!(analysis.bindings[3].as_ref().unwrap().input("value"), Ok(sampled));
+        assert_eq!(
+            analysis.bindings[3].as_ref().unwrap().input("value"),
+            Ok(sampled)
+        );
         let export = |name: &str| analysis.exports.iter().find(|e| e.name == name).unwrap();
         assert_eq!(export("height").slot, sampled);
         assert_eq!(export("height").field, "n1.noise");

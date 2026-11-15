@@ -24,8 +24,9 @@
 		if (value.trim() !== node.label) data.onLabel(node.id, value);
 	}
 
-	const SCOPE_LABEL = { world: 'world', column: 'chunk', voxel: 'voxel' } as const;
+	const SCOPE_LABEL = { atlas: 'atlas', world: 'world', column: 'chunk', voxel: 'voxel' } as const;
 	const SCOPE_HELP = {
+		atlas: 'Atlas node: runs once when the world is created, over whole-world grids (simulations). Reads atlas grids; connect world values through Rasterize, read results back through Sample.',
 		world: 'World node: runs once when the world is created, then read-only. Can only read other world nodes.',
 		column: 'Chunk node: runs per chunk column. Can read world and chunk values.',
 		voxel: 'Voxel node: runs per cell. Can read world, chunk and voxel values.'
@@ -282,6 +283,10 @@
 		background: #b58cf0;
 	}
 
+	.socket :global(.handle.atlas) {
+		background: #4fd1b5;
+	}
+
 	.scope-tag {
 		padding: 0 6px;
 		border-radius: 8px;
@@ -295,6 +300,10 @@
 		color: #b58cf0;
 	}
 
+	.scope-tag.atlas {
+		color: #4fd1b5;
+	}
+
 	.scope-tag.column {
 		color: #6fa8ff;
 	}
@@ -306,6 +315,11 @@
 	/* World nodes run once per world, not per chunk. */
 	.step-node.scope-world {
 		border-left: 3px solid #b58cf0;
+	}
+
+	/* Atlas nodes run once per world, over whole grids. */
+	.step-node.scope-atlas {
+		border-left: 3px solid #4fd1b5;
 	}
 
 	.params {

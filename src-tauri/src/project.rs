@@ -98,10 +98,10 @@ impl Project {
     }
 
     pub fn name(&self) -> String {
-        self.path
-            .as_deref()
-            .and_then(Path::file_stem)
-            .map_or_else(|| UNTITLED.to_owned(), |stem| stem.to_string_lossy().into_owned())
+        self.path.as_deref().and_then(Path::file_stem).map_or_else(
+            || UNTITLED.to_owned(),
+            |stem| stem.to_string_lossy().into_owned(),
+        )
     }
 
     pub fn is_dirty(&self, doc: &GraphDoc) -> bool {
@@ -168,7 +168,8 @@ pub fn read_doc(path: &Path) -> Result<GraphDoc, String> {
     let text = fs::read_to_string(path)
         .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
 
-    GraphDoc::from_json(&text).map_err(|error| format!("{} is not a valid graph: {error}", path.display()))
+    GraphDoc::from_json(&text)
+        .map_err(|error| format!("{} is not a valid graph: {error}", path.display()))
 }
 
 #[cfg(test)]
@@ -213,7 +214,14 @@ mod tests {
 
         assert_eq!(project.recent.len(), MAX_RECENT);
         assert_eq!(project.recent[0], PathBuf::from("5.json"));
-        assert_eq!(project.recent.iter().filter(|p| p.ends_with("5.json")).count(), 1);
+        assert_eq!(
+            project
+                .recent
+                .iter()
+                .filter(|p| p.ends_with("5.json"))
+                .count(),
+            1
+        );
 
         project.forget_recent(Path::new("5.json"));
         assert!(!project.recent.iter().any(|p| p.ends_with("5.json")));

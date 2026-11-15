@@ -4,12 +4,12 @@ import type { FieldGrid } from '../bridge';
 export const RAMPS = ['grayscale', 'terrain', 'thermal', 'diverging', 'categorical'] as const;
 export type Ramp = (typeof RAMPS)[number];
 
-export type FieldSource = 'column' | 'world';
+export type FieldSource = 'column' | 'world' | 'atlas';
 
 /** Declarative view mode. Coloring runs on the GPU; changing it never hits the backend. */
 export interface ViewMode {
 	source: FieldSource;
-	/** Index into WorldInfo.columnFields or WorldInfo.worldFields. */
+	/** Index into WorldInfo.columnFields, worldFields or atlas.fields. */
 	field: number;
 	ramp: Ramp;
 	min: number;

@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 
-export type FieldScope = 'voxel' | 'column' | 'world';
+export type FieldScope = 'voxel' | 'column' | 'world' | 'atlas';
 
 export interface FieldDef {
 	/** Unique id: `node.socket` for node outputs, the name for world fields. */
@@ -44,6 +44,40 @@ export interface WorldInfo {
 		/** 0..1 of the border samples that are land (0 = ocean all round). */
 		edgeLand: number;
 	};
+	atlas: AtlasInfo;
+}
+
+/** Whole-world grids of the graph's atlas nodes. */
+export interface AtlasInfo {
+	/** The real atlas is still building: chunks and world views wait. */
+	pending: boolean;
+	/** Atlas cells per side. */
+	grid: [number, number];
+	/** World columns per atlas cell. */
+	cellSize: number;
+	/** Atlas node outputs (served by slot through `atlasGrid`). */
+	fields: FieldDef[];
+	/** Scrubber frames (served by index through `atlasSnapshot`). */
+	snapshots: Array<{ node: string; label: string }>;
+}
+
+export type AtlasStatus =
+	| { state: 'idle' }
+	| { state: 'building'; node: string; index: number; total: number; fraction: number }
+	| { state: 'failed'; error: string };
+
+export interface RiverPath {
+	/** World columns, source to mouth. */
+	points: Array<[number, number]>;
+	/** Cells drained at each point. */
+	discharge: number[];
+}
+
+/** World size, depth and atlas cell size (saved in the graph). */
+export interface Extent {
+	size: [number, number];
+	depth: number;
+	cellSize: number;
 }
 
 /** Regular grid of field samples: sample (i, j) is at (originX + i*step, originY + j*step). */
@@ -67,11 +101,12 @@ export type NodeStatus = 'active' | 'disabled' | 'blocked';
  * per world and may feed chunk (`column`) inputs (sampled per column);
  * nothing flows from chunk or voxel scope into world nodes.
  */
-export type SocketScope = 'world' | 'column' | 'voxel';
+export type SocketScope = 'atlas' | 'world' | 'column' | 'voxel';
 
 /** Can an output of type `from` be wired into an input of type `to`? (Mirrors `can_connect`.) */
 export const canConnect = (from: SocketScope, to: SocketScope) =>
 	from === to || (from === 'world' && to === 'column');
+// Atlas sockets connect only to atlas sockets (Rasterize / Sample adapt).
 
 export interface SocketRef {
 	node: string;
@@ -263,6 +298,23 @@ export async function sampleWorld(
 export function worldPoint(x: number, y: number): Promise<number[] | null> {
 	return invoke<number[] | null>('world_point', { x, y });
 }
+
+export const atlasStatus = () => invoke<AtlasStatus>('atlas_status');
+
+/** One atlas grid by slot: one sample per atlas cell (`step` = cell size). */
+export async function atlasGrid(slot: number): Promise<FieldGrid> {
+	return parseFieldGrid(await invoke<ArrayBuffer>('atlas_grid', { slot }));
+}
+
+/** One scrubber frame (downsampled; `step` = columns per sample). */
+export async function atlasSnapshot(index: number): Promise<FieldGrid> {
+	return parseFieldGrid(await invoke<ArrayBuffer>('atlas_snapshot', { index }));
+}
+
+export const atlasRivers = () =>
+	invoke<Array<{ node: string; rivers: RiverPath[] }>>('atlas_rivers');
+
+export const setExtent = (extent: Extent) => invoke<PipelineGraph>('set_extent', { extent });
 
 export interface TemplateInfo {
 	id: string;

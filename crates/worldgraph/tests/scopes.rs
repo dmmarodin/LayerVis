@@ -100,12 +100,19 @@ fn world_nodes_run_first_and_chunk_nodes_read_them_by_implicit_sampling() {
     let (_, graph) = build(&doc);
     let analysis = graph.analysis();
 
-    let ids: Vec<_> = analysis.order.iter().map(|&i| doc.nodes[i].id.as_str()).collect();
+    let ids: Vec<_> = analysis
+        .order
+        .iter()
+        .map(|&i| doc.nodes[i].id.as_str())
+        .collect();
     assert_eq!(&ids[..2], ["n1", "n2"], "world nodes first");
 
     assert_eq!(report(&graph, "n1").scope, FieldScope::World);
     assert_eq!(report(&graph, "n3").scope, FieldScope::Voxel);
-    assert!(analysis.nodes.iter().all(|n| n.status == NodeStatus::Active));
+    assert!(analysis
+        .nodes
+        .iter()
+        .all(|n| n.status == NodeStatus::Active));
 
     // World outputs live in world slots, chunk outputs in column slots; the
     // sampled copy of n2.remapped takes the first column slot.
@@ -121,7 +128,10 @@ fn world_nodes_run_first_and_chunk_nodes_read_them_by_implicit_sampling() {
     // Sampled copies are not fields: the chunk nodes here produce no column outputs.
     assert!(analysis.schema.column_fields().is_empty());
     assert_eq!(analysis.schema.slot("n3.solid"), Ok(0));
-    assert_eq!(analysis.bindings[2].as_ref().unwrap().input("elevation"), Ok(0));
+    assert_eq!(
+        analysis.bindings[2].as_ref().unwrap().input("elevation"),
+        Ok(0)
+    );
 
     // A world output wired into an export is a column value for the game.
     let remapped = graph.export("remapped").unwrap();
@@ -179,11 +189,26 @@ fn wires_only_run_downward_through_the_scopes() {
     assert_eq!(report(&graph, "n2").status, NodeStatus::Blocked);
     assert_eq!(report(&graph, "n4").status, NodeStatus::Blocked);
 
-    assert!(worldgraph::can_connect(FieldScope::World, FieldScope::Column));
-    assert!(worldgraph::can_connect(FieldScope::World, FieldScope::World));
-    assert!(!worldgraph::can_connect(FieldScope::Column, FieldScope::World));
-    assert!(!worldgraph::can_connect(FieldScope::Voxel, FieldScope::Column));
-    assert!(!worldgraph::can_connect(FieldScope::World, FieldScope::Voxel));
+    assert!(worldgraph::can_connect(
+        FieldScope::World,
+        FieldScope::Column
+    ));
+    assert!(worldgraph::can_connect(
+        FieldScope::World,
+        FieldScope::World
+    ));
+    assert!(!worldgraph::can_connect(
+        FieldScope::Column,
+        FieldScope::World
+    ));
+    assert!(!worldgraph::can_connect(
+        FieldScope::Voxel,
+        FieldScope::Column
+    ));
+    assert!(!worldgraph::can_connect(
+        FieldScope::World,
+        FieldScope::Voxel
+    ));
 }
 
 #[test]
@@ -224,7 +249,11 @@ fn world_values_reach_the_neighborhood_stage_across_chunk_borders() {
     );
     let (world, graph) = build(&doc);
     assert!(graph.analysis().prefix_len.is_some());
-    assert_eq!(report(&graph, "n1").stage, None, "world nodes are not chunk stages");
+    assert_eq!(
+        report(&graph, "n1").stage,
+        None,
+        "world nodes are not chunk stages"
+    );
 
     let smoothed = graph.export("smoothed").unwrap().slot;
     let chunk = graph.generate(ChunkCoord(33, 31, 0), &world).unwrap();
@@ -268,8 +297,16 @@ fn world_reroutes_chain_and_feed_columns() {
     );
     let (world, graph) = build(&doc);
 
-    assert!(graph.analysis().nodes.iter().all(|n| n.status == NodeStatus::Active));
-    assert_eq!(graph.analysis().schema.world_fields().len(), 1, "reroutes add no fields");
+    assert!(graph
+        .analysis()
+        .nodes
+        .iter()
+        .all(|n| n.status == NodeStatus::Active));
+    assert_eq!(
+        graph.analysis().schema.world_fields().len(),
+        1,
+        "reroutes add no fields"
+    );
     assert_eq!(graph.export("value").unwrap().field, "n1.noise");
 
     let slot = graph.export("value").unwrap().slot;
@@ -286,9 +323,15 @@ fn identical_world_nodes_give_identical_worlds_and_signatures_track_world_edits(
     let mut b = a.clone();
     b.nodes[3].label = Some("renamed".into()); // chunk node
 
-    assert_eq!(worldgraph::world_signature(&a), worldgraph::world_signature(&b));
+    assert_eq!(
+        worldgraph::world_signature(&a),
+        worldgraph::world_signature(&b)
+    );
     b.nodes[1] = with_param(node("n2", "world_remap"), "out_max", 3.0); // world node
-    assert_ne!(worldgraph::world_signature(&a), worldgraph::world_signature(&b));
+    assert_ne!(
+        worldgraph::world_signature(&a),
+        worldgraph::world_signature(&b)
+    );
     // No world nodes, no world signature.
     assert_eq!(
         worldgraph::world_signature(&doc(vec![node("n1", "export_column")], vec![])),

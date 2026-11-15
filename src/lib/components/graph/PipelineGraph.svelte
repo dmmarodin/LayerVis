@@ -71,6 +71,7 @@
 
 	/** Node kinds by where they run, for the Add node list. */
 	const SCOPE_GROUPS = [
+		{ scope: 'atlas', label: 'Atlas (whole-world grids, once)' },
 		{ scope: 'world', label: 'World (once per world)' },
 		{ scope: 'column', label: 'Chunk (per column)' },
 		{ scope: 'voxel', label: 'Voxel (per cell)' }
@@ -463,6 +464,10 @@
 
 	.flow :global(.svelte-flow__edge.world path) {
 		stroke: #b58cf0;
+	}
+
+	.flow :global(.svelte-flow__edge.atlas path) {
+		stroke: #4fd1b5;
 	}
 
 	.flow :global(.svelte-flow__edge.voxel path) {

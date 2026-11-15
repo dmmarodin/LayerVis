@@ -1,19 +1,23 @@
 //! World stage: the shared data `D` every chunk job reads.
 //!
-//! A [`WorldStore`] is built once when a world is created. What it holds is
-//! the compiled world-scope nodes of the graph (tectonics, elevation filters,
-//! noise, …, see `terrain.rs` and `steps.rs`): pure functions of `(x, y)`,
-//! read-only afterwards, with no world-sized allocations (worlds are
-//! DF-sized). Chunk nodes read world values through implicit sampling.
+//! A [`WorldStore`] is built once when a world is created. It holds the
+//! compiled world-scope nodes of the graph (tectonics, elevation filters,
+//! noise, …, see `terrain.rs` and `steps.rs`), which are pure functions of
+//! `(x, y)`, and the atlas: whole-world grids the graph's atlas nodes computed
+//! once (see `atlas.rs`). Everything is read-only afterwards. Chunk nodes read
+//! world values through implicit sampling.
+
+use std::sync::Arc;
 
 use layergen::PipelineConfig;
 use serde::Serialize;
 
 use crate::{
+    atlas::{Atlas, AtlasContext, AtlasHooks, DEFAULT_CELL_SIZE},
     graph::GraphDoc,
     pipeline::{
-        analyze, build_world_graph, resolve, world_signature, ResolvedNode, WorldBuildContext,
-        WorldGraph, EMPTY_WORLD_SIGNATURE,
+        analyze, build_world_stage, resolve, world_signature, AtlasSource, Build, Implementation,
+        ResolvedNode, WorldBuildContext, WorldGraph, EMPTY_WORLD_SIGNATURE,
     },
 };
 
@@ -41,6 +45,10 @@ pub struct WorldStore {
     graph: WorldGraph,
     /// `world_signature` of the doc `graph` was compiled from.
     signature: String,
+    /// The atlas grids (empty when the graph has no atlas nodes).
+    atlas: Arc<Atlas>,
+    /// Built with zero-filled atlas grids (`placeholder`), not the real ones.
+    placeholder: bool,
 }
 
 impl WorldStore {
@@ -48,12 +56,23 @@ impl WorldStore {
     pub fn new(config: &PipelineConfig) -> Self {
         let bounds = config.world();
 
+        let origin = bounds.origin();
+        let size = bounds.dimensions();
+
         Self {
-            world_min: bounds.origin(),
-            world_size: bounds.dimensions(),
+            world_min: origin,
+            world_size: size,
             seed: config.seed(),
             graph: WorldGraph::default(),
             signature: EMPTY_WORLD_SIGNATURE.to_owned(),
+            placeholder: false,
+            atlas: Arc::new(Atlas::empty(AtlasContext::new(
+                config.seed(),
+                (origin.0, origin.1),
+                (size.0, size.1),
+                size.2,
+                DEFAULT_CELL_SIZE,
+            ))),
         }
     }
 
@@ -61,8 +80,86 @@ impl WorldStore {
     /// build the config from `doc.seed`) and its world-scope nodes are
     /// compiled here, once. `GraphPipeline::build` refuses a world that was
     /// built from different world nodes.
+    ///
+    /// Atlas nodes run here, which can take a while: see `for_doc_with` for
+    /// progress and cancellation.
     pub fn for_doc(doc: &GraphDoc, config: &PipelineConfig) -> Result<Self, String> {
+        Self::build(doc, config, AtlasSource::Compute(AtlasHooks::default()))
+    }
+
+    /// `for_doc` with progress reports and cancellation for the atlas build
+    /// (a cancelled build returns `Err(ATLAS_CANCELLED)`).
+    pub fn for_doc_with(
+        doc: &GraphDoc,
+        config: &PipelineConfig,
+        hooks: AtlasHooks<'_>,
+    ) -> Result<Self, String> {
+        Self::build(doc, config, AtlasSource::Compute(hooks))
+    }
+
+    /// The world of a graph with zero-filled atlas grids: no atlas node runs.
+    /// Structurally complete (pipelines build against it), so editors can
+    /// publish an edit at once and build the real atlas in the background.
+    pub fn placeholder(doc: &GraphDoc, config: &PipelineConfig) -> Result<Self, String> {
+        let mut store = Self::build(doc, config, AtlasSource::Placeholder)?;
+        store.placeholder = true;
+        Ok(store)
+    }
+
+    /// True for `placeholder` worlds.
+    pub fn is_placeholder(&self) -> bool {
+        self.placeholder
+    }
+
+    /// Does building this graph's world run atlas nodes (the slow part)?
+    pub fn has_atlas_work(doc: &GraphDoc) -> bool {
+        let resolved: Vec<ResolvedNode> = doc.nodes.iter().map(resolve).collect();
+        let analysis = analyze(doc, &resolved);
+        analysis.order.iter().any(|&i| {
+            matches!(
+                resolved[i].implementation,
+                Some(Implementation::Builtin(Build::Atlas(_) | Build::Rasterize))
+            )
+        })
+    }
+
+    /// The world of a graph with a saved atlas (`Atlas::read`): no atlas node
+    /// runs. The atlas must come from the same graph's world nodes, seed and
+    /// size.
+    pub fn from_atlas(
+        doc: &GraphDoc,
+        config: &PipelineConfig,
+        atlas: &Atlas,
+    ) -> Result<Self, String> {
+        if atlas.signature() != world_signature(doc) {
+            return Err("the saved atlas was built from different world nodes".to_owned());
+        }
+        Self::build(doc, config, AtlasSource::Stored(atlas))
+    }
+
+    fn build(
+        doc: &GraphDoc,
+        config: &PipelineConfig,
+        source: AtlasSource<'_>,
+    ) -> Result<Self, String> {
         let mut store = Self::new(config);
+        let cell_size = match &doc.extent {
+            None => DEFAULT_CELL_SIZE,
+            Some(extent) => {
+                extent.validate()?;
+                let bounds = config.world();
+                if bounds.dimensions() != (extent.size.0, extent.size.1, extent.depth)
+                    || bounds.origin() != extent.origin()
+                {
+                    return Err(
+                        "the pipeline config's world bounds do not match the graph's \
+                                extent (build the config from `Extent`)"
+                            .to_owned(),
+                    );
+                }
+                extent.cell_size
+            }
+        };
 
         let resolved: Vec<ResolvedNode> = doc.nodes.iter().map(resolve).collect();
         let analysis = analyze(doc, &resolved);
@@ -72,10 +169,26 @@ impl WorldStore {
             size: (store.world_size.0, store.world_size.1),
             depth: store.world_size.2,
         };
+        let atlas_context = AtlasContext::new(
+            context.seed,
+            context.origin,
+            context.size,
+            context.depth,
+            cell_size,
+        );
 
-        store.graph = build_world_graph(doc, &resolved, &analysis, &context)?;
+        let (graph, mut atlas) =
+            build_world_stage(doc, &resolved, &analysis, &context, atlas_context, source)?;
+        store.graph = graph;
         store.signature = world_signature(doc);
+        atlas.signature = store.signature.clone();
+        store.atlas = Arc::new(atlas);
         Ok(store)
+    }
+
+    /// The atlas grids, rivers and snapshots (empty without atlas nodes).
+    pub fn atlas(&self) -> &Arc<Atlas> {
+        &self.atlas
     }
 
     /// The compiled world-scope nodes (empty for `new`).
@@ -112,7 +225,13 @@ impl WorldStore {
 
     /// Seeded fractal noise in [0, 1] for scripts.
     pub fn script_noise(&self, x: i64, y: i64, wavelength: f64) -> f32 {
-        fbm(self.seed ^ 0x5C21, x as f64, y as f64, wavelength.max(1.0), 4)
+        fbm(
+            self.seed ^ 0x5C21,
+            x as f64,
+            y as f64,
+            wavelength.max(1.0),
+            4,
+        )
     }
 
     /// Signed latitude in [-1, 1] across the world's Y extent.
@@ -265,4 +384,3 @@ pub(crate) fn fbm(seed: u64, x: f64, y: f64, wavelength: f64, octaves: u32) -> f
 
     (total / norm) as f32
 }
-

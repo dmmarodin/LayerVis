@@ -4,7 +4,15 @@ import { SceneManager } from './scene';
 import type { RenderView, ViewMode } from './fieldMaterial';
 import { ChunkStreamer, type StreamStats } from './streaming';
 import { WorldOverlay, type OverlayStats } from './overlay';
-import { worldPoint, type WorldInfo } from '../bridge';
+import { AtlasLayer } from './atlasLayer';
+import {
+	atlasGrid,
+	atlasRivers,
+	atlasSnapshot,
+	worldPoint,
+	type FieldGrid,
+	type WorldInfo
+} from '../bridge';
 
 export interface HoverInfo {
 	x: number;
@@ -13,6 +21,8 @@ export interface HoverInfo {
 	column: number[] | null;
 	/** Values of every world field at the column, in `worldFields` order (null outside the world). */
 	worldValues: number[] | null;
+	/** Value of the atlas grid (or scrubber frame) on screen, if one is shown. */
+	atlasValue: number | null;
 }
 
 export interface VisualizerCallbacks {
@@ -30,6 +40,14 @@ export class Visualizer {
 	private world: WorldInfo | null = null;
 	private streamer: ChunkStreamer | null = null;
 	private overlay: WorldOverlay | null = null;
+	private atlas: AtlasLayer | null = null;
+	/** Fetched atlas grids and frames, for the current world only. */
+	private atlasGrids = new Map<string, Promise<FieldGrid>>();
+	private atlasWorld = '';
+	/** Scrubber frame shown instead of the selected view (index), or null. */
+	private snapshot: number | null = null;
+	private showRivers = false;
+	private riversFor = '';
 	private callbacks: VisualizerCallbacks | null = null;
 	private view: RenderView = {
 		source: 'column',
@@ -70,9 +88,100 @@ export class Visualizer {
 		if (this.world && worldKey(this.world) !== worldKey(world)) this.overlay?.invalidate();
 		this.world = world;
 		this.callbacks = callbacks;
-		this.streamer = new ChunkStreamer(world, scene, () => this.view, callbacks.onStream);
+		// While the atlas builds, the published world is a placeholder: no
+		// chunks or world samples until the real one is published.
+		this.streamer = world.atlas.pending
+			? null
+			: new ChunkStreamer(world, scene, () => this.view, callbacks.onStream);
 		this.overlay ??= new WorldOverlay(scene, callbacks.onOverlay);
+		this.atlas ??= new AtlasLayer(scene);
+		if (worldKey(world) !== this.atlasWorld || world.atlas.pending) {
+			this.atlasWorld = worldKey(world);
+			this.atlasGrids.clear();
+		}
+		if (this.snapshot !== null && this.snapshot >= world.atlas.snapshots.length) this.snapshot = null;
 		this.refreshView();
+		this.refreshRivers();
+	}
+
+	/** Shows scrubber frame `index` (see `WorldInfo.atlas.snapshots`) over the map; null = back to the view. */
+	public setSnapshot(index: number | null): void {
+		this.snapshot = index;
+		this.refreshView();
+	}
+
+	public setRivers(visible: boolean): void {
+		this.showRivers = visible;
+		this.refreshRivers();
+	}
+
+	private async refreshRivers(): Promise<void> {
+		const world = this.world;
+		if (!world || !this.atlas) return;
+		const key = worldKey(world);
+
+		if (!this.showRivers || world.atlas.pending) {
+			this.atlas.setRivers(null);
+			this.riversFor = '';
+			return;
+		}
+		if (this.riversFor === key) return;
+		this.riversFor = key;
+
+		try {
+			const sets = await atlasRivers();
+			if (this.world && worldKey(this.world) === key && this.showRivers) {
+				this.atlas.setRivers(sets.flatMap((set) => set.rivers));
+			}
+		} catch (error) {
+			console.error('atlas_rivers failed', error);
+			this.riversFor = '';
+		}
+	}
+
+	/** Fetches (once per world) the grid of an atlas slot or scrubber frame. */
+	private atlasData(kind: 'field' | 'frame', index: number): Promise<FieldGrid> {
+		const key = `${kind}:${index}`;
+		let grid = this.atlasGrids.get(key);
+		if (!grid) {
+			grid = kind === 'field' ? atlasGrid(index) : atlasSnapshot(index);
+			grid.catch(() => this.atlasGrids.delete(key));
+			this.atlasGrids.set(key, grid);
+		}
+		return grid;
+	}
+
+	/** Shows the selected atlas field or scrubber frame (hides the layer otherwise). */
+	private async refreshAtlas(): Promise<void> {
+		const world = this.world;
+		const atlas = this.atlas;
+		if (!world || !atlas) return;
+
+		const slot =
+			this.view.source === 'atlas' ? world.atlas.fields[this.view.field]?.slot : undefined;
+		const wanted: ['field' | 'frame', number] | null =
+			world.atlas.pending
+				? null
+				: this.snapshot !== null
+					? ['frame', this.snapshot]
+					: slot !== undefined
+						? ['field', slot]
+						: null;
+
+		if (!wanted) {
+			atlas.show(null, this.view);
+			return;
+		}
+
+		const key = worldKey(world);
+		try {
+			const grid = await this.atlasData(...wanted);
+			// Still what should be on screen?
+			if (this.world && worldKey(this.world) === key) atlas.show(grid, this.view);
+		} catch (error) {
+			console.error('Atlas grid failed', error);
+			atlas.show(null, this.view);
+		}
 	}
 
 	/**
@@ -123,6 +232,7 @@ export class Visualizer {
 		const bounds = Context.getInstance().camera.viewBounds();
 		const { source, field } = this.view;
 
+		if (this.atlas?.visible) return this.atlas.range();
 		return source === 'column'
 			? (this.streamer?.visibleRange(bounds, field) ?? null)
 			: (this.overlay?.fieldRange(field) ?? null);
@@ -138,18 +248,23 @@ export class Visualizer {
 		// Stage fields are keys (`node.socket`): socket names are not unique.
 		view.hidden = isColumn && !!this.stageFields && !(field && this.stageFields.has(field.key));
 
-		let overlayField: number | null = isColumn ? null : view.field;
+		// Atlas fields and scrubber frames are whole-world grids of their own.
+		const atlasShown = view.source === 'atlas' || this.snapshot !== null;
+		let overlayField: number | null = isColumn || atlasShown ? null : view.field;
 
 		// Same-named world field backs a column view when zoomed out, unless
 		// the field is not computed yet at the selected step.
-		if (isColumn && !view.hidden) {
+		if (isColumn && !view.hidden && !atlasShown) {
 			const match = this.world.worldFields.findIndex((field) => field.name === name);
 			overlayField = match >= 0 ? match : null;
 		}
+		// A placeholder world has nothing worth sampling.
+		if (this.world.atlas.pending) overlayField = null;
 
-		this.streamer?.setEnabled(isColumn);
+		this.streamer?.setEnabled(isColumn && !atlasShown);
 		this.streamer?.applyView(this.view);
 		this.overlay?.setField(overlayField, this.view);
+		this.refreshAtlas();
 		this.scheduleUpdate();
 	}
 
@@ -205,7 +320,8 @@ export class Visualizer {
 		try {
 			const worldValues = await worldPoint(x, y);
 			const column = this.streamer?.columnValuesAt(x, y) ?? null;
-			this.callbacks.onHover({ x, y, column, worldValues });
+			const atlasValue = this.atlas?.valueAt(x, y) ?? null;
+			this.callbacks.onHover({ x, y, column, worldValues, atlasValue });
 		} catch (error) {
 			console.error('world_point failed', error);
 		} finally {

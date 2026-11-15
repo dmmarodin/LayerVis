@@ -32,7 +32,13 @@ use crate::{
 };
 
 /// Ramps the frontend knows; anything else in an `output:` entry is the unit.
-const RAMPS: &[&str] = &["grayscale", "terrain", "thermal", "diverging", "categorical"];
+const RAMPS: &[&str] = &[
+    "grayscale",
+    "terrain",
+    "thermal",
+    "diverging",
+    "categorical",
+];
 
 /// Guards against runaway scripts (per column call).
 const MAX_OPERATIONS: u64 = 200_000;
@@ -139,7 +145,11 @@ impl ScriptDef {
         }
 
         let mut seen = std::collections::HashSet::new();
-        for socket in reads.iter().map(String::as_str).chain(writes.iter().map(|w: &FieldSpec| w.name.as_ref())) {
+        for socket in reads
+            .iter()
+            .map(String::as_str)
+            .chain(writes.iter().map(|w: &FieldSpec| w.name.as_ref()))
+        {
             if !seen.insert(socket.to_owned()) {
                 return Err(format!("socket `{socket}` is declared twice"));
             }
@@ -285,7 +295,10 @@ impl ChunkStep<Voxel, ColumnData, WorldStore> for ScriptStep {
             map.insert("x".into(), Dynamic::from_int(gx as INT));
             map.insert("y".into(), Dynamic::from_int(gy as INT));
             for (name, slot) in &self.reads {
-                map.insert(name.as_str().into(), Dynamic::from_float(column[*slot] as FLOAT));
+                map.insert(
+                    name.as_str().into(),
+                    Dynamic::from_float(column[*slot] as FLOAT),
+                );
             }
 
             let mut this = Dynamic::from_map(map);
@@ -298,9 +311,7 @@ impl ChunkStep<Voxel, ColumnData, WorldStore> for ScriptStep {
             let _ = self
                 .engine
                 .call_fn_with_options::<Dynamic>(options, &mut scope, &self.ast, "column", ())
-                .map_err(|error| {
-                    format!("{}: {error} (at column {gx}, {gy})", self.id)
-                })?;
+                .map_err(|error| format!("{}: {error} (at column {gx}, {gy})", self.id))?;
 
             let result = this
                 .try_cast::<Map>()
@@ -308,7 +319,10 @@ impl ChunkStep<Voxel, ColumnData, WorldStore> for ScriptStep {
 
             for (name, slot) in &self.writes {
                 let value = result.get(name.as_str()).ok_or_else(|| {
-                    format!("{}: did not assign `{name}` (at column {gx}, {gy})", self.id)
+                    format!(
+                        "{}: did not assign `{name}` (at column {gx}, {gy})",
+                        self.id
+                    )
                 })?;
 
                 column[*slot] = number(value).ok_or_else(|| {
@@ -348,7 +362,9 @@ fn make_engine(world: Arc<WorldStore>) -> Engine {
         w.script_noise(x, y, wavelength) as FLOAT
     });
 
-    engine.register_fn("clamp", |v: FLOAT, lo: FLOAT, hi: FLOAT| v.clamp(lo, hi.max(lo)));
+    engine.register_fn("clamp", |v: FLOAT, lo: FLOAT, hi: FLOAT| {
+        v.clamp(lo, hi.max(lo))
+    });
     engine.register_fn("lerp", |a: FLOAT, b: FLOAT, t: FLOAT| a + (b - a) * t);
     engine.register_fn("smoothstep", |e0: FLOAT, e1: FLOAT, x: FLOAT| {
         let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
@@ -368,14 +384,22 @@ mod tests {
     fn template_parses_into_a_contract() {
         let def = ScriptDef::parse(TEMPLATE).unwrap();
 
-        let inputs: Vec<_> = def.contract.inputs.iter().map(|i| i.name.as_ref()).collect();
+        let inputs: Vec<_> = def
+            .contract
+            .inputs
+            .iter()
+            .map(|i| i.name.as_ref())
+            .collect();
 
         assert_eq!(def.contract.label, "Moisture");
         assert_eq!(inputs, ["elevation", "boundary_distance", "temperature"]);
         assert_eq!(def.contract.outputs.len(), 1);
         assert_eq!(def.contract.outputs[0].name, "moisture");
         assert_eq!(def.contract.outputs[0].ramp, "thermal");
-        assert_eq!((def.contract.outputs[0].min, def.contract.outputs[0].max), (0.0, 1.0));
+        assert_eq!(
+            (def.contract.outputs[0].min, def.contract.outputs[0].max),
+            (0.0, 1.0)
+        );
     }
 
     #[test]
@@ -388,22 +412,32 @@ mod tests {
 
     #[test]
     fn header_and_compile_errors_are_reported() {
-        assert!(ScriptDef::parse("fn column() {}").unwrap_err().contains("name"));
+        assert!(ScriptDef::parse("fn column() {}")
+            .unwrap_err()
+            .contains("name"));
         assert!(ScriptDef::parse("//! name: A\nfn column() {}")
             .unwrap_err()
             .contains("output"));
-        assert!(ScriptDef::parse("//! name: A\n//! writes: a\nfn other() {}")
-            .unwrap_err()
-            .contains("fn column()"));
-        assert!(ScriptDef::parse("//! name: A\n//! writes: a\nfn column() { let = }")
-            .unwrap_err()
-            .contains("compile error"));
-        assert!(ScriptDef::parse("//! name: A\n//! writes: a 0..x\nfn column() {}")
-            .unwrap_err()
-            .contains("line 2"));
-        assert!(ScriptDef::parse("//! name: A\n//! colour: red\n//! writes: a\nfn column() {}")
-            .unwrap_err()
-            .contains("unknown header key"));
+        assert!(
+            ScriptDef::parse("//! name: A\n//! writes: a\nfn other() {}")
+                .unwrap_err()
+                .contains("fn column()")
+        );
+        assert!(
+            ScriptDef::parse("//! name: A\n//! writes: a\nfn column() { let = }")
+                .unwrap_err()
+                .contains("compile error")
+        );
+        assert!(
+            ScriptDef::parse("//! name: A\n//! writes: a 0..x\nfn column() {}")
+                .unwrap_err()
+                .contains("line 2")
+        );
+        assert!(
+            ScriptDef::parse("//! name: A\n//! colour: red\n//! writes: a\nfn column() {}")
+                .unwrap_err()
+                .contains("unknown header key")
+        );
     }
 
     #[test]
@@ -424,6 +458,8 @@ mod tests {
         assert_eq!(def.contract.outputs[0].name, "y");
 
         let duplicate = "//! name: A\n//! input: v\n//! output: v\nfn column() {}";
-        assert!(ScriptDef::parse(duplicate).unwrap_err().contains("declared twice"));
+        assert!(ScriptDef::parse(duplicate)
+            .unwrap_err()
+            .contains("declared twice"));
     }
 }

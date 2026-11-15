@@ -114,12 +114,10 @@ impl Tectonics {
 
         // Domain warp gives boundaries an irregular, natural shape.
         let wavelength = self.warp_amplitude * 3.0;
-        let wx = x + (fbm(self.seed ^ 0xA1, x, y, wavelength, 3) as f64 - 0.5)
-            * 2.0
-            * self.warp_amplitude;
-        let wy = y + (fbm(self.seed ^ 0xB2, x, y, wavelength, 3) as f64 - 0.5)
-            * 2.0
-            * self.warp_amplitude;
+        let wx = x
+            + (fbm(self.seed ^ 0xA1, x, y, wavelength, 3) as f64 - 0.5) * 2.0 * self.warp_amplitude;
+        let wy = y
+            + (fbm(self.seed ^ 0xB2, x, y, wavelength, 3) as f64 - 0.5) * 2.0 * self.warp_amplitude;
 
         let (mut first, mut second) = ((usize::MAX, f64::MAX), (usize::MAX, f64::MAX));
 
@@ -155,8 +153,7 @@ impl Tectonics {
         let boundary_distance = ((second.1 - first.1) / (2.0 * separation)).max(0.0);
 
         // Positive when `a` moves toward `b` faster than `b` moves away.
-        let convergence =
-            (a.velocity.0 - b.velocity.0) * nx + (a.velocity.1 - b.velocity.1) * ny;
+        let convergence = (a.velocity.0 - b.velocity.0) * nx + (a.velocity.1 - b.velocity.1) * ny;
 
         PlateSample {
             plate: first.0,
@@ -218,7 +215,10 @@ fn cluster_continents(
         .clamp(cores.len(), plates.len());
     let mut by_distance: Vec<(f64, usize)> = (0..plates.len())
         .map(|p| {
-            let nearest = cores.iter().map(|&c| distance(p, c)).fold(f64::MAX, f64::min);
+            let nearest = cores
+                .iter()
+                .map(|&c| distance(p, c))
+                .fold(f64::MAX, f64::min);
             (nearest, p)
         })
         .collect();
@@ -260,7 +260,9 @@ mod tests {
             let here = model.sample(x, 123);
             let next = model.sample(x + 1, 123);
 
-            if here.plate != next.plate && here.neighbor == next.plate && next.neighbor == here.plate
+            if here.plate != next.plate
+                && here.neighbor == next.plate
+                && next.neighbor == here.plate
             {
                 // (va - vb)·n_ab == (vb - va)·n_ba: a collision is a
                 // collision from either side.
