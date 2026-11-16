@@ -315,6 +315,9 @@ pub static EROSION: NodeKind = NodeKind {
         param("uplift_scale", 1.0, 0.0, 10.0),
         // Steepest slope kept by the thermal pass (height / horizontal distance).
         param("talus", 1.0, 0.05, 10.0),
+        // With strata: steepest slope (height / horizontal distance, between
+        // atlas cells) where bare rock weathers into soil again.
+        param("soil_slope", DEFAULT_SOIL_SLOPE, 0.0, 4.0),
     ],
     build: Build::Atlas(|bindings, params, _| {
         Ok(Box::new(ErosionStage {
@@ -333,6 +336,7 @@ pub static EROSION: NodeKind = NodeKind {
             area_exponent: params.get("area_exponent") as f32,
             uplift_scale: params.get("uplift_scale") as f32,
             talus: params.get("talus") as f32,
+            soil_slope: params.get("soil_slope") as f32,
         }) as BoxedAtlasStage)
     }),
 };
@@ -353,7 +357,11 @@ struct ErosionStage {
     area_exponent: f32,
     uplift_scale: f32,
     talus: f32,
+    soil_slope: f32,
 }
+
+/// Default `soil_slope` (about 14°).
+const DEFAULT_SOIL_SLOPE: f64 = 0.25;
 
 /// Flat-crossing slope added by the depression fill, in cells.
 const EPSILON: f32 = 1e-3;
@@ -527,7 +535,7 @@ impl AtlasStage for ErosionStage {
             &surface.heights,
             &surface.lifted,
             &rocks,
-            strata.map(|_| SoilCover::for_context(&context)),
+            strata.map(|_| SoilCover::for_context(&context, self.soil_slope)),
             width,
             height,
         );
@@ -636,12 +644,13 @@ pub(crate) struct SoilCover {
 }
 
 impl SoilCover {
-    pub fn for_context(context: &AtlasContext) -> Self {
+    /// `slope`: height per column (see erosion's `soil_slope`).
+    pub fn for_context(context: &AtlasContext, slope: f32) -> Self {
         let sea = context.sea_level();
         Self {
             sea,
             mountain: sea + 0.55 * (context.depth as f32 - sea),
-            slope: 0.25 * context.cell_size as f32,
+            slope: slope * context.cell_size as f32,
             depth: 1.0,
         }
     }
@@ -1115,7 +1124,7 @@ impl AtlasStage for GeologyStage {
                 &surface.heights,
                 &surface.lifted,
                 &rocks,
-                Some(SoilCover::for_context(&context)),
+                Some(SoilCover::for_context(&context, DEFAULT_SOIL_SLOPE as f32)),
                 width,
                 height,
             )

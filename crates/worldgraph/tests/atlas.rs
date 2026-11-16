@@ -464,14 +464,26 @@ fn placeholder_worlds_build_without_running_atlas_nodes() {
 #[test]
 #[ignore]
 fn diagnostics_eroded_template() {
-    for (size, label) in [(2048u32, "test world"), (8192, "default world")] {
+    // `WG_SEEDS=1,2,3` runs those seeds on the default world only.
+    let runs: Vec<(u32, u64)> = match std::env::var("WG_SEEDS") {
+        Ok(seeds) => seeds.split(',').map(|s| (8192, s.trim().parse().unwrap())).collect(),
+        Err(_) => vec![(2048, 99), (8192, 12345)],
+    };
+    for (size, seed) in runs {
+        let label = format!("{size}² seed {seed}");
         let half = i64::from(size / 2);
         let config = PipelineConfig::new(
             WorldBounds::new((-half, -half, 0), (size, size, 128)).unwrap(),
             ChunkSize::new(32, 32, 32).unwrap(),
-            if size == 2048 { 99 } else { 12345 },
+            seed,
         );
-        let doc = steps::eroded_graph();
+        let mut doc = steps::eroded_graph();
+        // `WG_PARAMS=n18.mixing=0.2,n7.river_threshold=150` overrides params.
+        for item in std::env::var("WG_PARAMS").unwrap_or_default().split(',').filter(|s| !s.is_empty()) {
+            let (key, value) = item.split_once('=').unwrap();
+            let (node, param) = key.split_once('.').unwrap();
+            doc.node_mut(node).unwrap().params.insert(param.into(), value.parse().unwrap());
+        }
         let started = Instant::now();
         let world = Arc::new(WorldStore::for_doc(&doc, &config).unwrap());
         eprintln!("== {label}: built in {:?}", started.elapsed());
@@ -521,6 +533,51 @@ fn diagnostics_eroded_template() {
         histogram("n20.biome", &|id| biomes.get(id).unwrap().name.clone());
         histogram("n6.surface_material", &|id| materials.get(id).unwrap().name.clone());
         histogram("n16.surface_material", &|id| materials.get(id).unwrap().name.clone());
+        if std::env::var("WG_ROWS").is_ok() {
+            // Land averages per latitude band: wind, humidity, rain, height.
+            let (u, v) = (grid("n17.wind_u").values(), grid("n17.wind_v").values());
+            let (hum, pre) = (grid("n18.humidity").values(), grid("n18.precipitation").values());
+            let w = atlas.context().grid.0 as usize;
+            for band in (0..atlas.context().grid.1 as usize).step_by(16) {
+                let cells: Vec<usize> = land.iter().copied().filter(|&i| (i / w) / 16 == band / 16).collect();
+                if cells.is_empty() {
+                    continue;
+                }
+                let avg = |g: &[f32]| cells.iter().map(|&i| g[i]).sum::<f32>() / cells.len() as f32;
+                let lat = (band as f32 + 8.0) / atlas.context().grid.1 as f32 * 2.0 - 1.0;
+                eprintln!(
+                    "rows {band:3} lat {lat:+.2} land {:4}: u {:+.2} v {:+.2} hum {:.2} rain {:5.0} height {:5.1}",
+                    cells.len(), avg(u), avg(v), avg(hum), avg(pre), avg(elevation) - sea
+                );
+            }
+        }
+        if std::env::var("WG_ROWS").is_ok() {
+            // Why bare rock: above the soil line, or steep (max neighbor drop).
+            let surface = grid("n6.surface_material").values();
+            let soil = f32::from(materials.id("soil").unwrap());
+            let w = atlas.context().grid.0 as usize;
+            let mountain = sea + 0.55 * (128.0 - sea);
+            let (mut high, mut buckets) = (0usize, [0usize; 6]);
+            let mut bare = 0usize;
+            for &i in &land {
+                if surface[i] == soil {
+                    continue;
+                }
+                bare += 1;
+                if elevation[i] >= mountain {
+                    high += 1;
+                    continue;
+                }
+                let (x, y) = (i % w, i / w);
+                let at = |x: usize, y: usize| elevation[x.min(w - 1) + y.min(elevation.len() / w - 1) * w];
+                let drop = [at(x + 1, y), at(x.saturating_sub(1), y), at(x, y + 1), at(x, y.saturating_sub(1))]
+                    .iter()
+                    .map(|n| (n - elevation[i]).abs())
+                    .fold(0.0f32, f32::max);
+                buckets[((drop / 2.0) as usize).min(5)] += 1;
+            }
+            eprintln!("bare rock {bare}: above soil line {high}; by max drop (cells) 0-2/2-4/4-6/6-8/8-10/10+: {buckets:?}");
+        }
         let rivers = atlas.rivers();
         eprintln!(
             "rivers: {} lines",
@@ -628,4 +685,33 @@ fn dump_eroded_template_images() {
     let v = atlas.grid(graph.schema().slot("n20.biome").unwrap()).unwrap().values();
     let rgb: Vec<u8> = v.iter().flat_map(|&b| biomes.get(b as u16).unwrap().color).collect();
     write_png(&format!("{dir}/biome.png"), w, h, &rgb);
+
+    // Tile scale around the world center: the warped biome borders, trees
+    // darker, water blue (what the game draws).
+    let world_slot = |key: &str| {
+        graph.schema().world_fields().iter().find(|f| f.key == key).unwrap().slot
+    };
+    let (biome, tree, height, river) = (
+        world_slot("n21.out"),
+        world_slot("n28.points"),
+        world_slot("n25.elevation"),
+        world_slot("n25.river_depth"),
+    );
+    let side = 768i64;
+    let mut rgb = Vec::with_capacity((side * side * 3) as usize);
+    for row in 0..side {
+        let y = side / 2 - 1 - row;
+        for x in -side / 2..side / 2 {
+            let v = world.graph().eval(x, y);
+            let color = if v[river] > 0.0 || (v[height] as f32) < sea {
+                [40, 90, 170]
+            } else if v[tree] >= 0.5 {
+                [20, 60, 25]
+            } else {
+                biomes.get(v[biome] as u16).unwrap().color
+            };
+            rgb.extend_from_slice(&color);
+        }
+    }
+    write_png(&format!("{dir}/biome_tiles.png"), side as u32, side as u32, &rgb);
 }

@@ -1376,6 +1376,7 @@ pub fn build_world_stage(
                         context: atlas_context,
                         out: out_slot("out")?,
                         mode: params.get("mode").round().clamp(0.0, 2.0) as u8,
+                        warp: params.get("warp"),
                     }),
                 ));
             }

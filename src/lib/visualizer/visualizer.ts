@@ -185,6 +185,9 @@ export class Visualizer {
 		return grid;
 	}
 
+	/** Bumped by every `refreshAtlas`; a fetch that returns stale is dropped. */
+	private atlasRequest = 0;
+
 	/** Shows the selected atlas field or scrubber frame (hides the layer otherwise). */
 	private async refreshAtlas(): Promise<void> {
 		const world = this.world;
@@ -202,19 +205,21 @@ export class Visualizer {
 						? ['field', slot]
 						: null;
 
+		// Only the latest request may draw: an older, slower fetch (e.g. a field
+		// passed over in the dropdown) must not replace it when it lands.
+		const request = ++this.atlasRequest;
+
 		if (!wanted) {
 			atlas.show(null, this.view);
 			return;
 		}
 
-		const key = worldKey(world);
 		try {
 			const grid = await this.atlasData(...wanted);
-			// Still what should be on screen?
-			if (this.world && worldKey(this.world) === key) atlas.show(grid, this.view);
+			if (request === this.atlasRequest) atlas.show(grid, this.view);
 		} catch (error) {
 			console.error('Atlas grid failed', error);
-			atlas.show(null, this.view);
+			if (request === this.atlasRequest) atlas.show(null, this.view);
 		}
 	}
 

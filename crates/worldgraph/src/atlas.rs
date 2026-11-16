@@ -22,6 +22,7 @@ use crate::{
     materials::MaterialTable,
     pipeline::{Build, FieldSpec, InputSpec, NodeKind, ParamSpec, WorldStep},
     strata::{StrataGrid, STRATA_LAYERS},
+    world::fbm,
     FieldScope, ValueKind, WORLD_SLOTS,
 };
 
@@ -1030,7 +1031,7 @@ pub static SAMPLE: NodeKind = NodeKind {
     description: "Reads an atlas grid at any world point, so world and chunk \
                   nodes can use it. `mode` 0 = nearest cell (for categories such as \
                   biomes or materials), 1 = bilinear, 2 = bicubic (smooth, no facets \
-                  at cell borders).",
+                  at cell borders). `warp` (in cells) moves each read point by fractal                   noise, so nearest-cell categories get ragged, natural borders instead                   of square blocks (1 … 2 suits biomes; 0 = off).",
     inputs: &[InputSpec {
         name: Cow::Borrowed("in"),
         scope: FieldScope::Atlas,
@@ -1047,12 +1048,20 @@ pub static SAMPLE: NodeKind = NodeKind {
         ramp: Cow::Borrowed("grayscale"),
         display_from: Some(Cow::Borrowed("in")),
     }],
-    params: &[ParamSpec {
-        name: "mode",
-        default: 1.0,
-        min: 0.0,
-        max: 2.0,
-    }],
+    params: &[
+        ParamSpec {
+            name: "mode",
+            default: 1.0,
+            min: 0.0,
+            max: 2.0,
+        },
+        ParamSpec {
+            name: "warp",
+            default: 0.0,
+            min: 0.0,
+            max: 4.0,
+        },
+    ],
     build: Build::Sample,
 };
 
@@ -1088,23 +1097,47 @@ pub(crate) struct SampleStep {
     pub out: usize,
     /// 0 nearest, 1 bilinear, 2 bicubic.
     pub mode: u8,
+    /// Read-point displacement in cells (0 = none).
+    pub warp: f64,
+}
+
+/// Seeds of the two warp noise channels (kept apart from other noise users).
+const WARP_SEED_U: u64 = 0x5A3D_1E77_0B1A_C3E5;
+const WARP_SEED_V: u64 = 0x2F6B_9C41_D8E0_7A13;
+
+impl SampleStep {
+    /// Atlas cell coordinates of a column, displaced by the warp noise.
+    fn coords(&self, x: i64, y: i64) -> (f64, f64) {
+        let (u, v) = self.context.cell_coords(x, y);
+        if self.warp <= 0.0 {
+            return (u, v);
+        }
+        // Two cells per wavelength at the coarsest octave, down to an eighth
+        // of a cell, so borders wiggle at every scale.
+        let wavelength = f64::from(self.context.cell_size) * 2.0;
+        let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+        let seed = self.context.seed;
+        let noise = |salt: u64| f64::from(fbm(seed ^ salt, px, py, wavelength, 4)) * 2.0 - 1.0;
+        (u + noise(WARP_SEED_U) * self.warp, v + noise(WARP_SEED_V) * self.warp)
+    }
 }
 
 impl WorldStep for SampleStep {
     fn run(&self, x: i64, y: i64, slots: &mut [f64; WORLD_SLOTS]) {
+        let (u, v) = self.coords(x, y);
         slots[self.out] = match self.mode {
-            0 => {
+            0 if self.warp <= 0.0 => {
                 let (cx, cy) = self.context.cell_of(x, y);
                 f64::from(self.grid.get(cx, cy))
             }
-            1 => {
-                let (u, v) = self.context.cell_coords(x, y);
-                f64::from(self.grid.bilinear(u, v))
+            0 => {
+                // `cell_coords` puts cell centers on whole numbers.
+                let clamp = |c: f64, n: u32| (c.round().max(0.0) as u32).min(n - 1);
+                let (cx, cy) = (clamp(u, self.context.grid.0), clamp(v, self.context.grid.1));
+                f64::from(self.grid.get(cx, cy))
             }
-            _ => {
-                let (u, v) = self.context.cell_coords(x, y);
-                f64::from(self.grid.bicubic(u, v))
-            }
+            1 => f64::from(self.grid.bilinear(u, v)),
+            _ => f64::from(self.grid.bicubic(u, v)),
         };
     }
 }
@@ -1144,6 +1177,48 @@ mod tests {
         let left = grid.bicubic(1.999, 1.5);
         let right = grid.bicubic(2.001, 1.5);
         assert!((left - right).abs() < 0.1);
+    }
+
+    #[test]
+    fn warped_nearest_sampling_keeps_categories_and_breaks_up_cell_borders() {
+        // Left half 3, right half 7: the border is the column x = 64.
+        let context = AtlasContext::new(9, (0, 0), (128, 128), 128, 16);
+        let values = (0..64).map(|i| if i % 8 < 4 { 3.0 } else { 7.0 }).collect();
+        let grid = Arc::new(AtlasGrid::from_values(8, 8, values).unwrap());
+        let step = |warp| SampleStep {
+            grid: Arc::clone(&grid),
+            context,
+            out: 0,
+            mode: 0,
+            warp,
+        };
+        let read = |s: &SampleStep, x, y| {
+            let mut slots = [0.0; WORLD_SLOTS];
+            s.run(x, y, &mut slots);
+            slots[0]
+        };
+
+        let (plain, warped) = (step(0.0), step(1.0));
+        let mut moved = 0;
+        for y in 0..128 {
+            // Unwarped: the border is a straight line.
+            assert_eq!(read(&plain, 63, y), 3.0);
+            assert_eq!(read(&plain, 64, y), 7.0);
+            for x in 0..128 {
+                let v = read(&warped, x, y);
+                assert!(v == 3.0 || v == 7.0, "only grid values: {v}");
+                // Far from the border nothing changes (warp ≤ 1 cell).
+                if !(40..88).contains(&x) {
+                    assert_eq!(v, read(&plain, x, y));
+                }
+                if v != read(&plain, x, y) {
+                    moved += 1;
+                }
+            }
+            assert_eq!(read(&warped, 70, y), read(&warped, 70, y), "deterministic");
+        }
+        // The border wanders: a fair share of columns near it changed side.
+        assert!(moved > 128 * 2, "only {moved} columns moved");
     }
 
     #[test]

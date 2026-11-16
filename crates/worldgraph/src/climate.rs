@@ -419,6 +419,10 @@ pub static MOISTURE: NodeKind = NodeKind {
         param("season", 0.0, -1.0, 1.0),
         // Precipitation (mm/yr) of one unit of rain per step.
         param("scale", 120000.0, 1000.0, 1000000.0),
+        // Eddy mixing: share of the carried moisture exchanged with the air a
+        // few cells away each pass. Reaches where the prevailing winds
+        // diverge (the subtropical highs), so no land is bone dry. 0 = off.
+        param("mixing", 0.0, 0.0, 0.5),
     ],
     build: Build::Atlas(|bindings, params, _| {
         Ok(Box::new(MoistureStage {
@@ -437,6 +441,7 @@ pub static MOISTURE: NodeKind = NodeKind {
                 subtropics: params.get("subtropics") as f32,
                 season: params.get("season") as f32,
                 scale: params.get("scale") as f32,
+                mixing: params.get("mixing") as f32,
             },
         }) as BoxedAtlasStage)
     }),
@@ -452,6 +457,7 @@ struct MoistureParams {
     subtropics: f32,
     season: f32,
     scale: f32,
+    mixing: f32,
 }
 
 struct MoistureStage {
@@ -468,6 +474,8 @@ struct MoistureStage {
 const STEP: f32 = 1.5;
 /// Most of the carried moisture that can rain out in one step.
 const MAX_FALLOUT: f32 = 0.12;
+/// Distance (cells) of the eddy mixing exchange.
+const MIX_REACH: usize = 3;
 
 /// Steady-state moisture transport: returns (precipitation mm/yr, humidity).
 #[allow(clippy::too_many_arguments)]
@@ -561,7 +569,11 @@ fn moisture(
             next[i] = left;
             rain[i] = fall;
         }
-        std::mem::swap(&mut carried, &mut next);
+        if p.mixing > 0.0 {
+            mix(&next, &mut carried, w, h, p.mixing);
+        } else {
+            std::mem::swap(&mut carried, &mut next);
+        }
         run.progress(0.05 + 0.95 * f64::from(pass + 1) / f64::from(p.passes));
     }
 
@@ -572,6 +584,22 @@ fn moisture(
         .map(|(c, s)| (c / s.max(0.05)).clamp(0.0, 1.0))
         .collect();
     Ok((precipitation, humidity))
+}
+
+/// Eddy mixing: `out` = `from` blended (share `k`) with the mean of the
+/// cells `MIX_REACH` away in the four directions (clamped at the border).
+fn mix(from: &[f32], out: &mut [f32], w: usize, h: usize, k: f32) {
+    let r = MIX_REACH;
+    for y in 0..h {
+        let (up, down) = (y.saturating_sub(r) * w, (y + r).min(h - 1) * w);
+        let row = y * w;
+        for x in 0..w {
+            let (left, right) = (x.saturating_sub(r), (x + r).min(w - 1));
+            let around =
+                (from[row + left] + from[row + right] + from[up + x] + from[down + x]) * 0.25;
+            out[row + x] = from[row + x] * (1.0 - k) + around * k;
+        }
+    }
 }
 
 impl AtlasStage for MoistureStage {
@@ -756,6 +784,7 @@ mod tests {
             subtropics: 0.0,
             season: 0.0,
             scale: 120000.0,
+            mixing: 0.0,
         };
         let mut run = AtlasRun::new(AtlasHooks::default(), 1);
         let (rain, _) =
@@ -763,6 +792,43 @@ mod tests {
         let at = |x: u32| rain[(x + 4 * w) as usize];
         assert!(at(55) > at(35), "windward slope is wetter than the plain");
         assert!(at(75) < at(55), "rain shadow behind the ridge");
+    }
+
+    #[test]
+    fn mixing_brings_some_rain_where_the_wind_blows_off_the_land() {
+        use super::{moisture, MoistureParams};
+        use crate::atlas::{AtlasHooks, AtlasRun};
+
+        // Land in the west, ocean in the east; a slow wind from the west
+        // (offshore), as where the prevailing winds part.
+        let (w, h) = (80u32, 8u32);
+        let sea = 38.4;
+        let elevation: Vec<f32> =
+            (0..w * h).map(|i| if i % w < 60 { 45.0 } else { 10.0 }).collect();
+        let wind_u = vec![0.3; (w * h) as usize];
+        let wind_v = vec![0.0; (w * h) as usize];
+        let rain = |mixing| {
+            let params = MoistureParams {
+                passes: 300,
+                rain_rate: 0.01,
+                orographic: 0.0,
+                rain_belt: 0.0,
+                recycle: 0.5,
+                subtropics: 0.0,
+                season: 0.0,
+                scale: 120000.0,
+                mixing,
+            };
+            let mut run = AtlasRun::new(AtlasHooks::default(), 1);
+            moisture(&elevation, &wind_u, &wind_v, None, w, h, sea, params, &mut run)
+                .unwrap()
+                .0
+        };
+        let (still, mixed) = (rain(0.0), rain(0.3));
+        let at = |r: &[f32], x: u32| r[(x + 4 * w) as usize];
+        assert_eq!(at(&still, 55), 0.0, "no moisture ever reaches the lee coast");
+        assert!(at(&mixed, 55) > 1.0, "eddies carry some inland");
+        assert!(at(&mixed, 55) > at(&mixed, 40), "and the most near the sea");
     }
 
     #[test]

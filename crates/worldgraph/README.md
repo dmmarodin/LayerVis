@@ -87,7 +87,12 @@ default 16). They are global and eager, because erosion and river networks
 depend on whole drainage basins. Atlas sockets connect only to atlas sockets;
 world values reach them through **`rasterize`** (evaluated at cell centers,
 `supersample`² points per cell) and results go back through **`sample`**
-(`mode` 0 = nearest cell, 1 = bilinear), which is a world node. So the usual
+(`mode` 0 = nearest cell, 1 = bilinear, 2 = bicubic; `warp` > 0 displaces the read
+point by noise, giving nearest-sampled categories such as biomes ragged borders),
+which is a world node. Climate and erosion knobs worth knowing: `moisture`
+`recycle` (rain over land that evaporates again; keeps interiors from drying
+out) and `mixing` (eddy exchange where the prevailing winds part), and
+`erosion` `soil_slope` (steepest slope where bare rock weathers to soil). So the usual
 chain is tectonics → `rasterize` → `erosion` → `sample` → world/chunk nodes.
 
 - Building is the slow part: `WorldStore::for_doc_with(&doc, &config, hooks)`
