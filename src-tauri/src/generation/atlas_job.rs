@@ -168,6 +168,7 @@ impl AtlasJobs {
             AtlasHooks {
                 progress: Some(&progress),
                 cancelled: Some(&cancelled),
+                ..AtlasHooks::default()
             },
         );
 

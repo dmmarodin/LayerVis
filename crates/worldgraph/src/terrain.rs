@@ -7,6 +7,7 @@
 //! model.
 
 use std::borrow::Cow;
+use crate::WorldBuildContext;
 
 use crate::{
     pipeline::{BoxedWorldStep, Build, FieldSpec, InputSpec, NodeKind, ParamSpec, WorldStep},
@@ -148,7 +149,8 @@ pub static TECTONIC_ELEVATION: NodeKind = NodeKind {
     ],
     outputs: &[world_out("elevation", "cells", 0.0, 128.0, "terrain", None)],
     params: &[
-        // Plate base heights, as a fraction of the world depth (sea level is 0.3).
+        // Plate base heights, as a fraction of the world depth with the sea
+        // at 0.3 (`WorldBuildContext::height_cells` maps them to cells).
         param("land_height", 0.55, 0.0, 1.0),
         param("ocean_height", 0.22, 0.0, 1.0),
         // Scales the mountains raised where plates collide.
@@ -164,7 +166,7 @@ pub static TECTONIC_ELEVATION: NodeKind = NodeKind {
             neighbor_continental: bindings.input("neighbor_continental")?,
             out: bindings.output("elevation")?,
             seed: context.seed,
-            depth: f64::from(context.depth),
+            context: *context,
             land_height: params.get("land_height"),
             ocean_height: params.get("ocean_height"),
             mountains: params.get("mountains"),
@@ -180,7 +182,7 @@ struct TectonicElevationStep {
     neighbor_continental: usize,
     out: usize,
     seed: u64,
-    depth: f64,
+    context: WorldBuildContext,
     land_height: f64,
     ocean_height: f64,
     mountains: f64,
@@ -230,7 +232,8 @@ impl WorldStep for TectonicElevationStep {
         let detail = f64::from(fbm(self.seed, x as f64, y as f64, 96.0, 4)) - 0.5;
         height += detail * self.detail;
 
-        slots[self.out] = (height * self.depth).clamp(0.0, self.depth - 1.0);
+        let depth = f64::from(self.context.depth);
+        slots[self.out] = self.context.height_cells(height).clamp(0.0, depth - 1.0);
     }
 }
 
@@ -259,7 +262,7 @@ pub static EDGE_FALLOFF: NodeKind = NodeKind {
         param("falloff", 0.14, 0.0, 0.4),
         // Makes the coast irregular; only ever pushes it inward, so the margin holds.
         param("noise", 0.05, 0.0, 0.15),
-        // Sea floor height at the edges (fraction of the world depth).
+        // Sea floor height at the edges (fraction of the world depth, sea at 0.3).
         param("sea_floor", 0.12, 0.0, 0.28),
     ],
     build: Build::World(|bindings, params, context| {
@@ -270,10 +273,10 @@ pub static EDGE_FALLOFF: NodeKind = NodeKind {
             origin: context.origin,
             size: (i64::from(context.size.0), i64::from(context.size.1)),
             depth: f64::from(context.depth),
+            floor: context.height_cells(params.get("sea_floor")),
             margin: params.get("margin"),
             falloff: params.get("falloff"),
             noise: params.get("noise"),
-            sea_floor: params.get("sea_floor"),
         }) as BoxedWorldStep)
     }),
 };
@@ -288,7 +291,8 @@ struct EdgeFalloffStep {
     margin: f64,
     falloff: f64,
     noise: f64,
-    sea_floor: f64,
+    /// Sea floor height at the edges, in cells.
+    floor: f64,
 }
 
 impl WorldStep for EdgeFalloffStep {
@@ -306,7 +310,7 @@ impl WorldStep for EdgeFalloffStep {
 
         let start = self.margin * scale;
         let mask = smoothstep(start, start + (self.falloff * scale).max(1.0), distance);
-        let floor = self.sea_floor * self.depth;
+        let floor = self.floor;
 
         slots[self.out] = (floor + (elevation - floor) * mask).clamp(0.0, self.depth - 1.0);
     }
@@ -483,7 +487,17 @@ mod tests {
             let margin = falloff.params["margin"] * 8192.0;
 
             for seed in 1..=(if atlas { 1 } else { 6 }) {
-                let world = WorldStore::for_doc(&doc, &config(seed)).unwrap();
+                // Templates with their own extent (depth, sea level) build in it.
+                let config = match doc.extent {
+                    Some(extent) => PipelineConfig::new(
+                        WorldBounds::new(extent.origin(), (extent.size.0, extent.size.1, extent.depth))
+                            .unwrap(),
+                        ChunkSize::new(32, 32, 32).unwrap(),
+                        seed,
+                    ),
+                    None => config(seed),
+                };
+                let world = WorldStore::for_doc(&doc, &config).unwrap();
                 let sea = f64::from(world.sea_level());
                 let (lo, hi) = (-4096, 4095);
                 let inset = (margin * 0.99) as i64;

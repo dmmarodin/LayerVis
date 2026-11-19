@@ -22,6 +22,8 @@ pub enum MaterialCategory {
     Sediment,
     Fluid,
     Air,
+    /// Built by the game (planks, bricks, paving); never generated. Solid.
+    Constructed,
     /// A saved id whose name is not in the registry (a removed mod).
     Unknown,
 }
@@ -143,7 +145,8 @@ mod tests {
         let table = MaterialTable::builtin();
         for name in [
             "granite", "basalt", "gneiss", "marble", "slate", "sandstone", "shale", "limestone",
-            "soil", "sand", "gravel", "clay", "water", "air",
+            "soil", "sand", "gravel", "clay", "water", "air", "plank", "log", "thatch", "brick",
+            "stone_brick", "cobblestone", "path", "plaster", "roof_tile", "flagstone",
         ] {
             assert!(table.id(name).is_some(), "{name} missing");
         }

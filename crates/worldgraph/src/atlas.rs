@@ -203,6 +203,9 @@ pub struct AtlasContext {
     pub cell_size: u32,
     /// Atlas cells per side (the world size divided by `cell_size`, rounded up).
     pub grid: (u32, u32),
+    /// Sea level in cells (`Extent::sea_level`); None: 0.3 × depth.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sea: Option<u32>,
 }
 
 impl AtlasContext {
@@ -221,7 +224,13 @@ impl AtlasContext {
             depth,
             cell_size,
             grid: (size.0.div_ceil(cell_size), size.1.div_ceil(cell_size)),
+            sea: None,
         }
+    }
+
+    /// The same context with a sea level setting (cells).
+    pub fn with_sea_level(self, sea: Option<u32>) -> Self {
+        Self { sea, ..self }
     }
 
     /// A grid of this atlas's size.
@@ -231,7 +240,10 @@ impl AtlasContext {
 
     /// Elevation below which a column is ocean (matches `WorldStore::sea_level`).
     pub fn sea_level(&self) -> f32 {
-        self.depth as f32 * 0.3
+        match self.sea {
+            Some(sea) => sea as f32,
+            None => self.depth as f32 * 0.3,
+        }
     }
 
     /// The world column at the center of a cell (clamped into the world for
@@ -565,12 +577,16 @@ pub struct AtlasProgress {
     pub fraction: f64,
 }
 
-/// Callbacks for a long atlas build (both optional).
+/// Callbacks for a long atlas build (all optional). Build it with struct
+/// update syntax (`..AtlasHooks::default()`) so new hooks don't break callers.
 #[derive(Clone, Copy, Default)]
 pub struct AtlasHooks<'a> {
     pub progress: Option<&'a (dyn Fn(&AtlasProgress) + Sync)>,
     /// Polled during the build; returning true stops it with `CANCELLED`.
     pub cancelled: Option<&'a (dyn Fn() -> bool + Sync)>,
+    /// Each scrubber frame as soon as it is taken (live "simulate" views);
+    /// the same frames end up in `Atlas::snapshots` afterwards.
+    pub snapshot: Option<&'a (dyn Fn(&AtlasSnapshot) + Sync)>,
 }
 
 /// One scrubber frame: a downsampled copy of a grid during a node's run.
@@ -641,11 +657,15 @@ impl<'a> AtlasRun<'a> {
             .filter(|s| s.node == self.node)
             .count();
         if taken < SNAPSHOTS_PER_NODE {
-            self.snapshots.push(AtlasSnapshot {
+            let snapshot = AtlasSnapshot {
                 node: self.node.clone(),
                 label: label.into(),
                 grid: grid.downsampled(SNAPSHOT_SIDE),
-            });
+            };
+            if let Some(report) = self.hooks.snapshot {
+                report(&snapshot);
+            }
+            self.snapshots.push(snapshot);
         }
     }
 

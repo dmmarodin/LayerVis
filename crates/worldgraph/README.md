@@ -96,8 +96,11 @@ out) and `mixing` (eddy exchange where the prevailing winds part), and
 chain is tectonics → `rasterize` → `erosion` → `sample` → world/chunk nodes.
 
 - Building is the slow part: `WorldStore::for_doc_with(&doc, &config, hooks)`
-  reports progress (`AtlasProgress`) and stops with `ATLAS_CANCELLED` when the
-  `cancelled` hook returns true. `WorldStore::has_atlas_work(&doc)` tells
+  reports progress (`AtlasProgress`), stops with `ATLAS_CANCELLED` when the
+  `cancelled` hook returns true, and hands each simulation frame
+  (`AtlasSnapshot`: erosion steps, precipitation, epochs) to the `snapshot`
+  hook as it is taken, for live "simulate" views. Build `AtlasHooks` with
+  `..AtlasHooks::default()` so new hooks don't break callers. `WorldStore::has_atlas_work(&doc)` tells
   whether a graph has atlas nodes; `WorldStore::placeholder` builds a world
   with zero-filled grids at once (editors publish it while the real atlas
   builds).
@@ -151,7 +154,15 @@ reading the same name.
   cells and atlas cell size (default 16). Part of the world definition: build
   the `PipelineConfig` bounds from it (`Extent::origin`, `size`, `depth`);
   `WorldStore::for_doc` rejects a config that does not match. Without it the
-  config decides the size and the atlas uses 16-column cells.
+  config decides the size and the atlas uses 16-column cells. Optional
+  `seaLevel` (cells; default 0.3 × depth, so older graphs build the same
+  world): height parameters stay fractions of the depth with the sea at 0.3,
+  and `WorldBuildContext::height_cells` stretches 0–0.3 onto the ground below
+  the sea and 0.3–1 above it. Slope, lapse and biome-height settings are in
+  cells, so a deeper world needs them calibrated: template
+  `deep_eroded_continent` (384 levels, sea 180) sets erosion `talus` 0.6 and
+  `soil_slope` 0.62, seasons `lapse` 0.088 and biome `height_scale` 2.3 (the
+  biome table's heights are written for 128 levels).
 - `seed` (u64, default 12345 when missing): the world seed. A JSON number; JS
   readers lose precision above 2^53, so read it with a u64-safe parser.
 - `id`: unique, stable. `enabled` (default true), `position` (layout only),

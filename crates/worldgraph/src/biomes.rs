@@ -278,6 +278,16 @@ pub static BIOME: NodeKind = NodeKind {
             min: 0.01,
             max: 10.0,
         },
+        // The table's height ranges (cells above sea) are written for a
+        // 128-deep world (about 90 cells of land relief). Heights are divided
+        // by this before the lookup: about 2.3 suits 384 levels with the sea
+        // at 180.
+        ParamSpec {
+            name: "height_scale",
+            default: 1.0,
+            min: 0.1,
+            max: 10.0,
+        },
         // Discharge (cells drained) that counts as a big river (water = 0.8).
         ParamSpec {
             name: "river_discharge",
@@ -299,6 +309,7 @@ pub static BIOME: NodeKind = NodeKind {
             out_trees: bindings.output("tree_density")?,
             out_roughness: bindings.output("roughness")?,
             blend: params.get("blend") as f32,
+            height_scale: params.get("height_scale") as f32,
             river_discharge: params.get("river_discharge") as f32,
         }) as BoxedAtlasStage)
     }),
@@ -316,6 +327,7 @@ struct BiomeStage {
     out_trees: usize,
     out_roughness: usize,
     blend: f32,
+    height_scale: f32,
     river_discharge: f32,
 }
 
@@ -354,7 +366,7 @@ impl AtlasStage for BiomeStage {
                 let point = BiomePoint {
                     temperature: temperature[i],
                     precipitation: precipitation[i],
-                    elevation: elevation[i] - sea,
+                    elevation: (elevation[i] - sea) / self.height_scale,
                     slope,
                     water: if lake_here { 1.0 } else { river },
                     coast: coast[i],

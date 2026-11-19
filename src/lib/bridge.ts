@@ -62,6 +62,10 @@ export interface WorldInfo {
 		edgeLand: number;
 	};
 	atlas: AtlasInfo;
+	/** Sea level in cells. */
+	seaLevel: number;
+	/** The graph's sea level setting (null: 0.3 × depth). */
+	seaLevelSetting: number | null;
 }
 
 /** Whole-world grids of the graph's atlas nodes. */
@@ -95,6 +99,8 @@ export interface Extent {
 	size: [number, number];
 	depth: number;
 	cellSize: number;
+	/** Sea level in cells; omitted or null: 0.3 × depth. */
+	seaLevel?: number | null;
 }
 
 /** Regular grid of field samples: sample (i, j) is at (originX + i*step, originY + j*step). */

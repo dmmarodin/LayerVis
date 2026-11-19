@@ -66,6 +66,9 @@ pub struct WorldInfo {
     /// Changes when the world stage is rebuilt (seed or world nodes): cached
     /// overview samples are stale then.
     pub world_generation: u64,
+    /// Sea level in cells, and the graph's setting (None: 0.3 × depth).
+    pub sea_level: f32,
+    pub sea_level_setting: Option<u32>,
     pub atlas: AtlasInfo,
     /// The world's material ids (index = id): colors and names for the
     /// `material` ramp, legends and the cursor readout.
@@ -517,6 +520,8 @@ impl Session {
             exports: active.pipeline.exports().to_vec(),
             world_stats: active.stats,
             world_generation: active.world_generation,
+            sea_level: active.world.sea_level(),
+            sea_level_setting: active.world.sea_level_setting(),
             materials: active
                 .world
                 .materials()
@@ -2173,6 +2178,7 @@ mod tests {
             size: (2048, 2048),
             depth: 128,
             cell_size: 16,
+            sea_level: None,
         });
         doc.node_mut("n6")
             .unwrap()
@@ -2274,6 +2280,7 @@ mod tests {
                 size: (4096, 2048),
                 depth: 384,
                 cell_size: 32,
+                sea_level: None,
             })
             .unwrap();
         let info = session.world_info();

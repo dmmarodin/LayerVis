@@ -52,10 +52,6 @@ fn latitude(context: &WorldBuildContext, y: i64) -> f64 {
 
 // ---------------------------------------------------------------------------
 
-/// Sea level as a fraction of the world depth (matches the terrain ramp's
-/// water band and the oceanic plate height).
-const SEA_LEVEL: f64 = 0.3;
-
 pub static TEMPERATURE: NodeKind = NodeKind {
     id: "temperature",
     label: "Temperature",
@@ -128,6 +124,7 @@ pub static HUMIDITY: NodeKind = NodeKind {
             out: bindings.output("humidity")?,
             seed: context.seed ^ 0x3017,
             depth: f64::from(context.depth),
+            sea_level: context.sea_level(),
         }) as BoxedWorldStep)
     }),
 };
@@ -138,11 +135,12 @@ struct HumidityStep {
     out: usize,
     seed: u64,
     depth: f64,
+    sea_level: f64,
 }
 
 impl WorldStep for HumidityStep {
     fn run(&self, x: i64, y: i64, slots: &mut [f64; WORLD_SLOTS]) {
-        let sea_level = self.depth * SEA_LEVEL;
+        let sea_level = self.sea_level;
         let elevation = slots[self.elevation];
 
         slots[self.out] = if elevation < sea_level {

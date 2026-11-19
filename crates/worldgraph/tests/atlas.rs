@@ -198,7 +198,7 @@ fn atlas_build_reports_progress_and_can_be_cancelled() {
         &config,
         AtlasHooks {
             progress: Some(&progress),
-            cancelled: None,
+            ..AtlasHooks::default()
         },
     )
     .unwrap();
@@ -233,12 +233,33 @@ fn atlas_build_reports_progress_and_can_be_cancelled() {
         AtlasHooks {
             progress: Some(&watch),
             cancelled: Some(&cancelled),
+            ..AtlasHooks::default()
         },
     )
     .err()
     .unwrap();
     assert!(error.contains(ATLAS_CANCELLED), "{error}");
     assert!(polls.load(Ordering::SeqCst) > 0);
+}
+
+#[test]
+fn snapshot_hook_streams_the_frames_the_atlas_keeps() {
+    let config = config();
+    let doc = eroded(6.0);
+    let frames = std::sync::Mutex::new(Vec::new());
+    let snapshot = |s: &worldgraph::AtlasSnapshot| frames.lock().unwrap().push(s.clone());
+    let world = WorldStore::for_doc_with(
+        &doc,
+        &config,
+        AtlasHooks {
+            snapshot: Some(&snapshot),
+            ..AtlasHooks::default()
+        },
+    )
+    .unwrap();
+    let frames = frames.into_inner().unwrap();
+    assert!(!frames.is_empty(), "erosion takes frames");
+    assert_eq!(frames.as_slice(), world.atlas().snapshots());
 }
 
 #[test]
@@ -374,6 +395,7 @@ fn extent_sets_the_atlas_grid_and_must_match_the_config() {
         size: (2048, 2048),
         depth: 128,
         cell_size: 32,
+        sea_level: None,
     });
     assert_ne!(
         world_signature(&doc),
@@ -395,6 +417,73 @@ fn extent_sets_the_atlas_grid_and_must_match_the_config() {
 
     // A format 2 graph (no extent) keeps its old signature format.
     assert!(!plain_signature.contains("cellSize"));
+}
+
+#[test]
+fn a_sea_level_setting_moves_the_sea_and_keeps_old_graphs() {
+    use worldgraph::WorldBuildContext;
+
+    // Height fractions: unchanged without a setting, stretched around the sea with one.
+    let mut context = WorldBuildContext {
+        seed: 1,
+        origin: (0, 0),
+        size: (256, 256),
+        depth: 384,
+        sea_level: None,
+    };
+    assert_eq!(context.height_cells(0.55), 0.55 * 384.0);
+    assert_eq!(context.sea_level(), 384.0 * 0.3);
+    context.sea_level = Some(180);
+    assert_eq!(context.height_cells(0.3), 180.0);
+    assert_eq!(context.height_cells(0.0), 0.0);
+    assert_eq!(context.height_cells(1.0), 384.0);
+    assert_eq!(context.height_cells(0.15), 90.0);
+    assert_eq!(context.sea_level(), 180.0);
+
+    // A deep world with its sea at z 180: land and sea split there.
+    let config = PipelineConfig::new(
+        WorldBounds::new((-512, -512, 0), (1024, 1024, 384)).unwrap(),
+        ChunkSize::new(32, 32, 32).unwrap(),
+        7,
+    );
+    let mut doc = eroded(4.0);
+    let plain = world_signature(&doc);
+    doc.extent = Some(Extent {
+        size: (1024, 1024),
+        depth: 384,
+        cell_size: 16,
+        sea_level: None,
+    });
+    let unset = world_signature(&doc);
+    assert!(!unset.contains("seaLevel"), "no setting, no field");
+    doc.extent = Some(Extent {
+        sea_level: Some(180),
+        ..doc.extent.unwrap()
+    });
+    assert_ne!(world_signature(&doc), unset);
+    assert_ne!(plain, unset);
+    let world = Arc::new(WorldStore::for_doc(&doc, &config).unwrap());
+    assert_eq!(world.sea_level(), 180.0);
+    assert_eq!(world.atlas().context().sea_level(), 180.0);
+    let graph = GraphPipeline::build(&doc, config, &world).unwrap();
+    let slot = graph.elevation_world_slot().unwrap();
+    let heights: Vec<f64> = (-500..500)
+        .step_by(25)
+        .flat_map(|y| (-500..500).step_by(25).map(move |x| (x, y)))
+        .map(|(x, y)| world.graph().eval(x, y)[slot])
+        .collect();
+    let land = heights.iter().filter(|&&h| h >= 180.0).count() as f64 / heights.len() as f64;
+    assert!(land > 0.05 && land < 0.8, "land {land}");
+    assert!(heights.iter().all(|&h| (0.0..384.0).contains(&h)));
+    // The corner (edge falloff) is deep sea, below the old sea level too.
+    assert!(world.graph().eval(-510, -510)[slot] < 0.3 * 384.0);
+
+    // Out-of-range settings are refused.
+    doc.extent = Some(Extent {
+        sea_level: Some(384),
+        ..doc.extent.unwrap()
+    });
+    assert!(doc.extent.unwrap().validate().is_err());
 }
 
 /// Timing of the eroded template on LayerVis's default world (512² atlas).
@@ -426,7 +515,7 @@ fn timing_default_world() {
         &config,
         AtlasHooks {
             progress: Some(&progress),
-            cancelled: None,
+            ..AtlasHooks::default()
         },
     )
     .unwrap();
@@ -472,12 +561,23 @@ fn diagnostics_eroded_template() {
     for (size, seed) in runs {
         let label = format!("{size}² seed {seed}");
         let half = i64::from(size / 2);
+        // `WG_DEPTH=384 WG_SEA=180`: a deeper world with its own sea level.
+        let depth: u32 = std::env::var("WG_DEPTH").map_or(128, |v| v.parse().unwrap());
+        let sea_level: Option<u32> = std::env::var("WG_SEA").ok().map(|v| v.parse().unwrap());
         let config = PipelineConfig::new(
-            WorldBounds::new((-half, -half, 0), (size, size, 128)).unwrap(),
+            WorldBounds::new((-half, -half, 0), (size, size, depth)).unwrap(),
             ChunkSize::new(32, 32, 32).unwrap(),
             seed,
         );
         let mut doc = steps::eroded_graph();
+        if depth != 128 || sea_level.is_some() {
+            doc.extent = Some(Extent {
+                size: (size, size),
+                depth,
+                cell_size: 16,
+                sea_level,
+            });
+        }
         // `WG_PARAMS=n18.mixing=0.2,n7.river_threshold=150` overrides params.
         for item in std::env::var("WG_PARAMS").unwrap_or_default().split(',').filter(|s| !s.is_empty()) {
             let (key, value) = item.split_once('=').unwrap();
@@ -511,6 +611,7 @@ fn diagnostics_eroded_template() {
             );
         };
         eprintln!("land fraction {:.2}", land.len() as f32 / elevation.len() as f32);
+        pct("n6.elevation");
         pct("n18.precipitation");
         pct("n19.temperature");
         pct("n7.discharge");

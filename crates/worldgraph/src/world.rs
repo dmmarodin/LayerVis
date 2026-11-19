@@ -51,6 +51,8 @@ pub struct WorldStore {
     atlas: Arc<Atlas>,
     /// Built with zero-filled atlas grids (`placeholder`), not the real ones.
     placeholder: bool,
+    /// Sea level in cells (`Extent::sea_level`); None: 0.3 × depth.
+    sea: Option<u32>,
 }
 
 impl WorldStore {
@@ -68,6 +70,7 @@ impl WorldStore {
             graph: WorldGraph::default(),
             signature: EMPTY_WORLD_SIGNATURE.to_owned(),
             placeholder: false,
+            sea: None,
             atlas: Arc::new(Atlas::empty(AtlasContext::new(
                 config.seed(),
                 (origin.0, origin.1),
@@ -145,6 +148,7 @@ impl WorldStore {
         source: AtlasSource<'_>,
     ) -> Result<Self, String> {
         let mut store = Self::new(config);
+        store.sea = doc.extent.and_then(|extent| extent.sea_level);
         let cell_size = match &doc.extent {
             None => DEFAULT_CELL_SIZE,
             Some(extent) => {
@@ -170,6 +174,7 @@ impl WorldStore {
             origin: (store.world_min.0, store.world_min.1),
             size: (store.world_size.0, store.world_size.1),
             depth: store.world_size.2,
+            sea_level: store.sea,
         };
         let atlas_context = AtlasContext::new(
             context.seed,
@@ -177,7 +182,8 @@ impl WorldStore {
             context.size,
             context.depth,
             cell_size,
-        );
+        )
+        .with_sea_level(store.sea);
 
         let (graph, mut atlas) =
             build_world_stage(doc, &resolved, &analysis, &context, atlas_context, source)?;
@@ -232,7 +238,15 @@ impl WorldStore {
     /// Elevation below which a column is ocean. Matches the terrain ramp's
     /// water band and the oceanic plate base height.
     pub fn sea_level(&self) -> f32 {
-        self.depth() * 0.3
+        match self.sea {
+            Some(sea) => sea as f32,
+            None => self.depth() * 0.3,
+        }
+    }
+
+    /// The graph's sea level setting (`Extent::sea_level`), if any.
+    pub fn sea_level_setting(&self) -> Option<u32> {
+        self.sea
     }
 
     /// Low-frequency noise in [0, 1] for moisture variation.

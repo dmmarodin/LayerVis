@@ -110,6 +110,15 @@
 		ramp = (RAMPS as readonly string[]).includes(def.ramp) ? (def.ramp as Ramp) : 'grayscale';
 		min = def.min;
 		max = def.max;
+		if (ramp === 'terrain' && world) {
+			// Heights: the ramp's coast (30%) at this world's sea level. A
+			// default world (sea at 0.3 × depth) gets 0 … depth.
+			const depth = world.dimensions[2];
+			const sea = world.seaLevel;
+			const low = sea - ((depth - sea) * 0.3) / 0.7;
+			min = Math.abs(low) < 1e-6 ? 0 : low;
+			max = depth;
+		}
 	}
 
 	function autoRange() {
@@ -229,12 +238,15 @@
 	let extentHeight = 0;
 	let extentDepth = 0;
 	let extentCell = 0;
+	/** Sea level in cells; empty: 0.3 × depth. */
+	let extentSea: number | null = null;
 	let extentFor: WorldInfo | null = null;
 
 	$: if (world && world !== extentFor) {
 		extentFor = world;
 		[extentWidth, extentHeight, extentDepth] = world.dimensions;
 		extentCell = world.atlas.cellSize;
+		extentSea = world.seaLevelSetting;
 	}
 
 	$: extentChanged =
@@ -242,13 +254,21 @@
 		(extentWidth !== world.dimensions[0] ||
 			extentHeight !== world.dimensions[1] ||
 			extentDepth !== world.dimensions[2] ||
-			extentCell !== world.atlas.cellSize);
+			extentCell !== world.atlas.cellSize ||
+			seaSetting(extentSea) !== world.seaLevelSetting);
+
+	/** An empty or invalid sea level input means "the default". */
+	function seaSetting(value: number | null | string): number | null {
+		const n = typeof value === 'string' ? Number(value) : value;
+		return n === null || value === '' || !Number.isFinite(n) || n <= 0 ? null : Math.round(n);
+	}
 
 	function applyExtent() {
 		onExtent({
 			size: [Math.round(extentWidth), Math.round(extentHeight)],
 			depth: Math.round(extentDepth),
-			cellSize: Math.round(extentCell)
+			cellSize: Math.round(extentCell),
+			seaLevel: seaSetting(extentSea)
 		});
 	}
 
@@ -347,7 +367,7 @@
 			</div>
 
 			<div class="field">
-				<span class="label">Size · depth · atlas cell (columns)</span>
+				<span class="label">Size · depth · atlas cell · sea level</span>
 				<div class="row">
 					<input class="mono" type="number" min="256" step="256" title="Width" disabled={busy} bind:value={extentWidth} />
 					<input class="mono" type="number" min="256" step="256" title="Height" disabled={busy} bind:value={extentHeight} />
@@ -355,6 +375,17 @@
 				<div class="row">
 					<input class="mono" type="number" min="32" step="32" title="Depth (cells)" disabled={busy} bind:value={extentDepth} />
 					<input class="mono" type="number" min="1" title="Atlas cell size (columns)" disabled={busy} bind:value={extentCell} />
+				</div>
+				<div class="row">
+					<input
+						class="mono"
+						type="number"
+						min="1"
+						placeholder="sea {(extentDepth * 0.3).toFixed(1)}"
+						title="Sea level (cells); empty: 0.3 × depth. Height parameters stretch around it."
+						disabled={busy}
+						bind:value={extentSea}
+					/>
 				</div>
 				{#if extentChanged}
 					<button class="small" disabled={busy} on:click={applyExtent}>Apply size (new world)</button>

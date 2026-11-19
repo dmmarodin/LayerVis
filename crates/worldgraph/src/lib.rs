@@ -73,8 +73,9 @@ pub const COLUMN_SLOTS: usize = 16;
 /// World-scope outputs (one slot per world node output).
 pub const WORLD_SLOTS: usize = 32;
 
-/// Field-bag voxel: outputs map to fixed slots via the schema.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// Field-bag voxel: outputs map to fixed slots via the schema. Serde lets
+/// games store edited voxels (LayerGen replacements) on disk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, serde::Deserialize)]
 pub struct Voxel {
     pub slots: [f32; VOXEL_SLOTS],
     /// Material ids (indices into the world's `MaterialTable`), one per
@@ -507,7 +508,7 @@ impl GenerationDefinition<Voxel> for DeferredGraphDefinition {
         };
         let hooks = AtlasHooks {
             progress: Some(&progress),
-            cancelled: None,
+            ..AtlasHooks::default()
         };
         let world = Arc::new(WorldStore::for_doc_with(&self.doc, &self.config, hooks)?);
         // Repeated direct calls build the same world again (deterministic):

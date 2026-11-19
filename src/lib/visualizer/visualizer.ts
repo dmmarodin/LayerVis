@@ -136,7 +136,7 @@ export class Visualizer {
 			...this.sliceSettings,
 			enabled: this.sliceSettings.enabled && !world.atlas.pending,
 			heightField,
-			seaLevel: world.dimensions[2] * 0.3
+			seaLevel: world.seaLevel
 		});
 	}
 

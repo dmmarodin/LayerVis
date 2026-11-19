@@ -52,6 +52,12 @@ pub struct Extent {
     /// Columns per atlas cell side.
     #[serde(default = "default_cell_size")]
     pub cell_size: u32,
+    /// Sea level in cells. None: 0.3 × depth (every graph before this
+    /// setting). Height parameters stay fractions of the depth with the sea
+    /// at 0.3; a sea level stretches 0–0.3 onto the ground below it and
+    /// 0.3–1 onto the range above it (`WorldBuildContext::height_cells`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sea_level: Option<u32>,
 }
 
 fn default_cell_size() -> u32 {
@@ -64,6 +70,7 @@ impl Extent {
         size: (8192, 8192),
         depth: 128,
         cell_size: crate::atlas::DEFAULT_CELL_SIZE,
+        sea_level: None,
     };
 
     /// Minimum corner of the world bounds (centered on the origin).
@@ -78,6 +85,9 @@ impl Extent {
         }
         if !(32..=4096).contains(&self.depth) {
             return Err("world depth must be between 32 and 4096 cells".to_owned());
+        }
+        if self.sea_level.is_some_and(|sea| sea == 0 || sea >= self.depth) {
+            return Err("sea level must be above 0 and below the world depth".to_owned());
         }
         if !(1..=1024).contains(&self.cell_size) {
             return Err("atlas cell size must be between 1 and 1024 columns".to_owned());
@@ -275,6 +285,7 @@ mod tests {
                 size: (4096, 2048),
                 depth: 384,
                 cell_size: 32,
+                sea_level: None,
             }),
             ..doc.clone()
         };
@@ -298,6 +309,7 @@ mod tests {
         assert!(
             Extent {
                 cell_size: 1,
+                sea_level: None,
                 ..Extent::DEFAULT
             }
             .validate()

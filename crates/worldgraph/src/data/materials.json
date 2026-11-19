@@ -12,5 +12,15 @@
   { "name": "soil", "category": "soil", "erodibility": 2.5, "color": [110, 78, 48] },
   { "name": "sand", "category": "sediment", "erodibility": 3.0, "color": [232, 212, 150] },
   { "name": "gravel", "category": "sediment", "erodibility": 2.0, "color": [150, 145, 135] },
-  { "name": "clay", "category": "sediment", "erodibility": 1.8, "color": [170, 110, 80] }
+  { "name": "clay", "category": "sediment", "erodibility": 1.8, "color": [170, 110, 80] },
+  { "name": "plank", "category": "constructed", "erodibility": 0.0, "color": [172, 128, 74] },
+  { "name": "log", "category": "constructed", "erodibility": 0.0, "color": [110, 76, 44] },
+  { "name": "thatch", "category": "constructed", "erodibility": 0.0, "color": [196, 170, 86] },
+  { "name": "brick", "category": "constructed", "erodibility": 0.0, "color": [156, 74, 58] },
+  { "name": "stone_brick", "category": "constructed", "erodibility": 0.0, "color": [140, 138, 130] },
+  { "name": "cobblestone", "category": "constructed", "erodibility": 0.0, "color": [118, 116, 110] },
+  { "name": "path", "category": "constructed", "erodibility": 0.0, "color": [150, 118, 80] },
+  { "name": "plaster", "category": "constructed", "erodibility": 0.0, "color": [222, 214, 196] },
+  { "name": "roof_tile", "category": "constructed", "erodibility": 0.0, "color": [176, 84, 52] },
+  { "name": "flagstone", "category": "constructed", "erodibility": 0.0, "color": [160, 156, 148] }
 ]

@@ -69,6 +69,37 @@ pub struct WorldBuildContext {
     pub size: (u32, u32),
     /// World depth in cells (the elevation range).
     pub depth: u32,
+    /// Sea level in cells (`Extent::sea_level`); None: 0.3 × depth.
+    pub sea_level: Option<u32>,
+}
+
+impl WorldBuildContext {
+    /// Sea level in cells.
+    pub fn sea_level(&self) -> f64 {
+        match self.sea_level {
+            Some(sea) => f64::from(sea),
+            None => f64::from(self.depth) * 0.3,
+        }
+    }
+
+    /// A height given as a fraction of the depth with the sea at 0.3 (how
+    /// height parameters are written), in cells. Without a sea level setting
+    /// this is `fraction × depth` exactly; with one, 0–0.3 maps onto the
+    /// ground below the sea and 0.3–1 onto the range above it.
+    pub fn height_cells(&self, fraction: f64) -> f64 {
+        let depth = f64::from(self.depth);
+        match self.sea_level {
+            None => fraction * depth,
+            Some(sea) => {
+                let sea = f64::from(sea);
+                if fraction < 0.3 {
+                    fraction / 0.3 * sea
+                } else {
+                    sea + (fraction - 0.3) / 0.7 * (depth - sea)
+                }
+            }
+        }
+    }
 }
 
 /// The world-scope part of a graph, compiled: runs every world node at a point.

@@ -79,7 +79,7 @@
 	let sliceLevel = 64;
 	let fogDepth = 24;
 	$: depth = world?.dimensions[2] ?? 128;
-	$: seaLevel = depth * 0.3;
+	$: seaLevel = world?.seaLevel ?? depth * 0.3;
 	$: sliceLevel = Math.min(Math.max(0, Math.round(sliceLevel)), depth);
 	$: visualizer?.setSlice(sliceEnabled, sliceLevel, fogDepth);
 

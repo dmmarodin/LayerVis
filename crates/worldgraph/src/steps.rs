@@ -81,7 +81,7 @@ pub struct GraphTemplate {
 
 /// Starting graphs: the original scattered-land world and a few continent
 /// layouts (each ends in an edge falloff, so the map is ocean all round).
-pub static TEMPLATES: [GraphTemplate; 7] = [
+pub static TEMPLATES: [GraphTemplate; 8] = [
     GraphTemplate {
         id: "default",
         label: "Default (scattered land)",
@@ -152,7 +152,47 @@ pub static TEMPLATES: [GraphTemplate; 7] = [
                       flooded land gathers sediment. Slower to build.",
         build: epochs_graph,
     },
+    GraphTemplate {
+        id: "deep_eroded_continent",
+        label: "Deep eroded continent (384 levels)",
+        description: "The eroded continent in a 384-level world with the sea at z 180:                       about 180 levels underground and peaks up to about 200 above the sea,                       with erosion, climate and biome heights calibrated to match.",
+        build: deep_eroded_graph,
+    },
 ];
+
+/// Depth and sea level of the deep template (the game's design target).
+pub const DEEP_DEPTH: u32 = 384;
+pub const DEEP_SEA_LEVEL: u32 = 180;
+
+/// `eroded_graph` in a 384-level world with the sea at 180. Height parameters
+/// stretch around the sea (`WorldBuildContext::height_cells`), so relief above
+/// the sea is about 2.3× taller in cells; slope and altitude settings are
+/// calibrated so biomes, bare rock and temperatures match the 128-level world
+/// (`cargo test --release --test atlas -- --ignored diagnostics` with
+/// `WG_DEPTH=384 WG_SEA=180`).
+pub fn deep_eroded_graph() -> GraphDoc {
+    let mut doc = eroded_graph();
+    doc.extent = Some(crate::graph::Extent {
+        depth: DEEP_DEPTH,
+        sea_level: Some(DEEP_SEA_LEVEL),
+        ..crate::graph::Extent::DEFAULT
+    });
+    for (node, param, value) in [
+        // Talus (steepest slope) and bare-rock slope: real slopes now (1 cell = 1 column).
+        ("n6", "talus", 0.6),
+        ("n6", "soil_slope", 0.62),
+        // Cooling per cell above the sea, for the taller relief.
+        ("n19", "lapse", 0.088),
+        // Biome heights are written for 128 levels.
+        ("n20", "height_scale", 2.3),
+    ] {
+        doc.node_mut(node)
+            .expect("eroded template node")
+            .params
+            .insert(param.into(), value);
+    }
+    doc
+}
 
 /// Graph of a fresh session: tectonics → tectonic elevation (world nodes),
 /// feeding temperature and a solid fill, with elevation exported as `height`

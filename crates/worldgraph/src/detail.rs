@@ -95,7 +95,7 @@ pub static TERRAIN_DETAIL: NodeKind = NodeKind {
             wavelength: params.get("wavelength"),
             octaves: params.get("octaves").round() as u32,
             coast_band: params.get("coast_band"),
-            sea: f64::from(context.depth) * 0.3,
+            sea: context.sea_level(),
             top: f64::from(context.depth) - 1.0,
         }) as BoxedWorldStep)
     }),
